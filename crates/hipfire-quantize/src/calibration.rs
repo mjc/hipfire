@@ -1841,13 +1841,12 @@ fn llama3_from_rope_freqs(
         })
         .collect();
     let (low_wavelen, high_wavelen) = if last_short + 1 == first_long {
-        let short_w = wavelen[last_short];
-        let long_w = wavelen[first_long];
-        if long_w <= short_w {
-            return None;
-        }
-        let mid = 0.5 * (short_w + long_w);
-        (mid * (1.0 + 1e-6), mid * (1.0 - 1e-6))
+        // No blend sample. Both thresholds have to sit in the open gap,
+        // with the high wavelength below an integer original context.
+        // Placing them on one midpoint and then rounding can make
+        // high_freq_factor smaller than low_freq_factor, which the loader
+        // rejects.
+        no_middle_thresholds(wavelen[last_short], wavelen[first_long])?
     } else if last_short + 2 == first_long {
         // One middle pair makes the two-parameter fit singular. The low
         // wavelength has to be an integer context length; rounding a real
@@ -1905,7 +1904,9 @@ fn llama3_from_rope_freqs(
     let original_u = original as u64;
     let low_freq = 1.0;
     let high_freq = original / high_wavelen;
-    if !(high_freq.is_finite() && high_freq > 0.0 && high_freq != low_freq) {
+    // `llama3_scaling` rejects a high factor that is not strictly above the
+    // low factor. A block that fails that check must not be emitted.
+    if !(high_freq.is_finite() && high_freq > low_freq) {
         return None;
     }
     let rebuilt = llama3_divisors(theta, head_dim, scale, low_freq, high_freq, original);
@@ -1918,6 +1919,39 @@ fn llama3_from_rope_freqs(
         return None;
     }
     Some((scale, low_freq, high_freq, original_u))
+}
+
+/// Thresholds for a table whose short and long plateaus meet with no blend pair.
+///
+/// `low_freq_factor` stays 1, so the low wavelength is the original context.
+/// That integer has to lie strictly inside the gap. The high wavelength lies
+/// strictly below it, so `high_freq_factor` stays above 1. Any such pair
+/// reproduces the table, because no sample falls between the thresholds.
+fn no_middle_thresholds(short_w: f64, long_w: f64) -> Option<(f64, f64)> {
+    if !(short_w.is_finite() && long_w.is_finite() && long_w > short_w && short_w >= 0.0) {
+        return None;
+    }
+    let floor_u64 = |value: f64| -> Option<u64> {
+        if !value.is_finite() || value < 0.0 || value >= (1u64 << 53) as f64 {
+            return None;
+        }
+        Some(value.floor() as u64)
+    };
+    let min_original = floor_u64(short_w)?.checked_add(1)?;
+    let mut max_original = floor_u64(long_w)?;
+    if long_w == long_w.floor() {
+        max_original = max_original.checked_sub(1)?;
+    }
+    if max_original < min_original {
+        return None;
+    }
+    let original = min_original + (max_original - min_original) / 2;
+    let original_f = original as f64;
+    let high_wavelen = 0.5 * (short_w + original_f);
+    if !(high_wavelen.is_finite() && high_wavelen > short_w && high_wavelen < original_f) {
+        return None;
+    }
+    Some((original_f, high_wavelen))
 }
 
 /// Both thresholds for a table with a single blend sample.
@@ -2830,6 +2864,63 @@ mod gemma4_config_tests {
         .unwrap();
         let cfg = config_json_from_gguf(&gguf, "llama", 0);
         assert!(cfg.get("rope_scaling").is_none());
+    }
+
+    /// Head dim 128, theta 500000, factor 8, low 1, high 1.1, original 4096.
+    /// No pair falls in the blend band, so the table is 32 ones then 32 eights.
+    /// The recovered factors are an equivalent schedule the runtime accepts.
+    #[test]
+    fn llama_gguf_no_middle_pair_recovers_llama3() {
+        const THETA: f64 = 500_000.0;
+        const DIM: usize = 128;
+        const FACTOR: f64 = 8.0;
+        const LOW: f64 = 1.0;
+        const HIGH: f64 = 1.1;
+        const ORIGINAL: f64 = 4096.0;
+        let low_wavelen = ORIGINAL / LOW;
+        let high_wavelen = ORIGINAL / HIGH;
+        let divisors: Vec<f32> = (0..DIM / 2)
+            .map(|pair| {
+                let inv_freq = 1.0 / THETA.powf((2 * pair) as f64 / DIM as f64);
+                let wavelen = 2.0 * std::f64::consts::PI / inv_freq;
+                let divisor = if wavelen < high_wavelen {
+                    1.0
+                } else if wavelen > low_wavelen {
+                    FACTOR
+                } else {
+                    let smooth = (ORIGINAL / wavelen - LOW) / (HIGH - LOW);
+                    1.0 / ((1.0 - smooth) / FACTOR + smooth)
+                };
+                divisor as f32
+            })
+            .collect();
+        assert!(divisors.iter().take(32).all(|d| *d == 1.0));
+        assert!(divisors.iter().skip(32).all(|d| *d == 8.0));
+        let gguf = gguf_with_divisors(llama31_stock_meta(), "rope_freqs.weight", &divisors);
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
+        let scaling = hipfire_runtime::rope::rope_scaling(&cfg).expect("runtime accepts the block");
+        let rdna_compute::rope::RopeScaling::Llama3(s) = scaling else {
+            panic!("expected llama3, got {scaling:?}");
+        };
+        assert!(s.high_freq_factor > s.low_freq_factor);
+        assert!((s.factor - FACTOR).abs() < 1e-4, "factor {}", s.factor);
+        let rope = rdna_compute::rope::Rope {
+            theta: THETA,
+            scaling,
+        };
+        let (freqs, attn) = rope.inv_freq(DIM);
+        assert_eq!(attn, 1.0);
+        let base: Vec<f64> = (0..DIM / 2)
+            .map(|pair| 1.0 / THETA.powf((2 * pair) as f64 / DIM as f64))
+            .collect();
+        for (pair, divisor) in divisors.iter().enumerate() {
+            let got = freqs[pair];
+            let want = base[pair] / f64::from(*divisor);
+            assert!(
+                (got - want).abs() <= 1e-4 * want.abs().max(1.0),
+                "pair {pair}: got {got} want {want}"
+            );
+        }
     }
 
     /// Head dim 8, theta 500000, one middle pair between the short and long
