@@ -312,14 +312,10 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
-    // MQ3-Lloyd residual: `gpu.gemm_mq3g256_lloyd_residual_wmma` is WMMA-only —
-    // `_for_arch` routes the gfx12 (RDNA4) sibling else the gfx11 (RDNA3) kernel
-    // and PANICS on any other arch (the is_batchable_la upstream gate guarantees
-    // only RDNA3/RDNA4 reach it). Real support is WMMA-only → HasWmma (includes
-    // gfx12). Mirrors FusedQkvMq3G256Lloyd / FusedGateUpMq3G256Lloyd.
+    // gfx1010 uses scalar F32; WMMA-capable devices use their existing kernels.
     registry.register(KernelVariant {
         key: KernelKey::GemmMq3G256LloydResidual,
-        arch_required: ArchPredicate::HasWmma,
+        arch_required: ArchPredicate::HasWmmaOrGfx1010,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,

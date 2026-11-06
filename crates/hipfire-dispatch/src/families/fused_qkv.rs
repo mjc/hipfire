@@ -672,8 +672,11 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wv, x, __cap_n, k);
 
             match params.batch_size {
-                // Prefill mq3-lloyd is WMMA-only (`gemm_qkv_mq3g256_lloyd_wmma`);
-                // arch_required=HasWmma gates the entry.
+                Some(n) if gpu.arch_caps.is_gfx1010() => {
+                    hip!(gpu.gemm_mq3_lloyd_gfx1010(wq, x, q, mq, k, n, false))?;
+                    hip!(gpu.gemm_mq3_lloyd_gfx1010(wk, x, kout, mk, k, n, false))?;
+                    hip!(gpu.gemm_mq3_lloyd_gfx1010(wv, x, v, mv, k, n, false))
+                }
                 Some(n) => {
                     hip!(gpu
                         .gemm_qkv_mq3g256_lloyd_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
@@ -1023,6 +1026,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(w_alpha, x, __cap_n, k);
 
             match params.batch_size {
+                Some(n) if gpu.arch_caps.is_gfx1010() => {
+                    hip!(gpu.gemm_mq3_lloyd_gfx1010(wqkv, x, qkv, mqkv, k, n, false))?;
+                    hip!(gpu.gemm_mq3_lloyd_gfx1010(wz, x, z, mz, k, n, false))?;
+                    hip!(gpu.gemm_mq3_lloyd_gfx1010(w_beta, x, beta, mbeta, k, n, false))?;
+                    hip!(gpu.gemm_mq3_lloyd_gfx1010(w_alpha, x, alpha, malpha, k, n, false))
+                }
                 Some(n) => hip!(gpu.gemm_qkvza_mq3g256_lloyd_wmma(
                     wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
                     n
@@ -1396,8 +1405,10 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(w_up, x, __cap_n, k);
 
             match params.batch_size {
-                // Prefill mq3-lloyd is WMMA-only (`gemm_gate_up_mq3g256_lloyd_wmma`,
-                // routed for_arch over RDNA3/RDNA4); arch_required=HasWmma gates entry.
+                Some(n) if gpu.arch_caps.is_gfx1010() => {
+                    hip!(gpu.gemm_mq3_lloyd_gfx1010(w_gate, x, gate, mg, k, n, false))?;
+                    hip!(gpu.gemm_mq3_lloyd_gfx1010(w_up, x, up, mu, k, n, false))
+                }
                 Some(n) => {
                     hip!(gpu
                         .gemm_gate_up_mq3g256_lloyd_wmma(w_gate, w_up, x, gate, up, mg, mu, k, n))
