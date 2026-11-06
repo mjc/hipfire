@@ -4324,8 +4324,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // gfx10 RDNA1/2 scalar HFQ3 batched-prefill family (Phase 1).
     // Routes the four LA + FA matchers below to the new non-WMMA kernels
     // (gemm_qkv_hfq3g256, gemm_qkvza_hfq3g256, gemm_gate_up_hfq3g256,
-    // gemm_hfq3g256_residual). Lloyd-MQ3 stays gated on gfx11+ — no
-    // gfx1010 Lloyd uses the scalar batched projection path.
+    // gemm_hfq3g256_residual). Lloyd MQ3 has a separate scalar gfx1010 path.
     let mq3_uniform_with_gfx10_scalar = matches!(dt, DType::MQ3G256)
         && matches!(
             arch,
