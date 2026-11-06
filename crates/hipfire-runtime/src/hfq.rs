@@ -2477,6 +2477,22 @@ fn llama_config_from_value(
     let head_dim = raw
         .head_dim
         .unwrap_or(raw.hidden_size / raw.num_attention_heads);
+    // Top-level `rope_theta` wins. A config that moved the base into
+    // `rope_parameters` or `rope_scaling` still has to use that value; the
+    // serde default of 10000 is only for a checkpoint that names neither.
+    let positive = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_f64)
+            .filter(|theta| theta.is_finite() && *theta > 0.0)
+    };
+    let rope_freq_base = positive(config.get("rope_theta"))
+        .or_else(|| {
+            ["rope_parameters", "rope_scaling"]
+                .into_iter()
+                .find_map(|key| positive(config.get(key).and_then(|block| block.get("rope_theta"))))
+        })
+        .map(|theta| theta as f32)
+        .unwrap_or(raw.rope_theta);
     Ok(LlamaConfig {
         arch,
         dim: raw.hidden_size,
@@ -2488,7 +2504,7 @@ fn llama_config_from_value(
         head_dim,
         norm_eps: raw.rms_norm_eps,
         max_seq_len: raw.max_position_embeddings,
-        rope_freq_base: raw.rope_theta,
+        rope_freq_base,
         rope_llama3: llama3_rope(config)?,
         bos_token: first_token_or(raw.bos_token_id.as_ref(), 1),
         eos_token: first_token_or(raw.eos_token_id.as_ref(), 2),
@@ -2535,10 +2551,16 @@ fn llama3_rope(config: &serde_json::Value) -> Result<rdna_compute::rope::RopeLla
         .get("original_max_position_embeddings")
         .and_then(serde_json::Value::as_u64)
         .ok_or("llama: llama3 rope_parameters missing original_max_position_embeddings")?;
-    if !(factor.is_finite() && factor >= 1.0 && high > low) {
+    if !(factor.is_finite()
+        && factor >= 1.0
+        && low.is_finite()
+        && high.is_finite()
+        && low > 0.0
+        && high > low)
+    {
         return Err(format!(
-            "llama: llama3 rope needs factor >= 1 and high_freq_factor > low_freq_factor \
-             (factor {factor}, low {low}, high {high})"
+            "llama: llama3 rope needs a finite factor >= 1, a finite low_freq_factor > 0, \
+             and high_freq_factor > low_freq_factor (factor {factor}, low {low}, high {high})"
         ));
     }
     Ok(RopeLlama3::new(factor, low, high, original as usize))
@@ -3721,6 +3743,41 @@ mod llama_config_tests {
         let config = envelope.get("config").unwrap();
         let c = llama_config_from_value(config, true).unwrap();
         assert!(c.has_qk_norm);
+    }
+
+    fn llama31_published() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "intermediate_size": 14336,
+            "vocab_size": 128256,
+            "rms_norm_eps": 1e-5,
+            "max_position_embeddings": 131072,
+            "rope_theta": 500000.0,
+            "rope_scaling": {
+                "factor": 8.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192,
+                "rope_type": "llama3"
+            }
+        })
+    }
+
+    #[test]
+    fn nested_rope_theta_is_the_base_when_the_top_level_key_is_absent() {
+        let mut config = llama31_published();
+        config.as_object_mut().unwrap().remove("rope_theta");
+        config["rope_scaling"]["rope_theta"] = serde_json::json!(500000.0);
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(c.rope_freq_base, 500000.0);
+        let mut top = llama31_published();
+        top["rope_scaling"]["rope_theta"] = serde_json::json!(10000.0);
+        let c = llama_config_from_value(&top, false).unwrap();
+        assert_eq!(c.rope_freq_base, 500000.0);
     }
 }
 
