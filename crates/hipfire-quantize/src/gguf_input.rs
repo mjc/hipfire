@@ -278,6 +278,15 @@ impl GgufFile {
         &self.mmap[start..end]
     }
 
+    /// Like [`Self::tensor_data`], but `None` when the declared extent is
+    /// outside the mapped payload. Callers that can skip a tensor use this
+    /// instead of panicking on a truncated file.
+    pub fn tensor_data_checked(&self, info: &TensorInfo) -> Option<&[u8]> {
+        let start = self.tensor_data_offset.checked_add(info.offset)?;
+        let end = start.checked_add(info.byte_size())?;
+        self.mmap.get(start..end)
+    }
+
     pub fn meta(&self, key: &str) -> Option<&MetaValue> {
         self.metadata.get(key)
     }

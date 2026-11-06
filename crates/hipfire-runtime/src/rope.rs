@@ -98,9 +98,9 @@ fn llama3_scaling(params: Option<&Value>) -> Result<RopeScaling, String> {
     if !(factor.is_finite() && factor >= 1.0) {
         return Err(format!("llama3 factor {factor} must be finite and >= 1"));
     }
-    if !(low.is_finite() && high.is_finite()) || high == low {
+    if !(low.is_finite() && high.is_finite() && low > 0.0 && high > low) {
         return Err(format!(
-            "llama3 low_freq_factor {low} and high_freq_factor {high} must be finite and differ"
+            "llama3 low_freq_factor {low} and high_freq_factor {high} must be finite, and high must be greater than low"
         ));
     }
     Ok(RopeScaling::Llama3(Llama3 {
@@ -226,6 +226,15 @@ mod tests {
             .remove("high_freq_factor");
         let err = resolve(&missing, None).unwrap_err();
         assert!(err.contains("high_freq_factor"), "{err}");
+        let mut inverted = llama31();
+        inverted["rope_scaling"]["low_freq_factor"] = json!(4.0);
+        inverted["rope_scaling"]["high_freq_factor"] = json!(1.0);
+        let err = resolve(&inverted, None).unwrap_err();
+        assert!(err.contains("greater than low"), "{err}");
+        let mut negative = llama31();
+        negative["rope_scaling"]["low_freq_factor"] = json!(-1.0);
+        let err = resolve(&negative, None).unwrap_err();
+        assert!(err.contains("greater than low"), "{err}");
         let unscaled = json!({
             "rope_theta": 500000.0,
             "max_position_embeddings": 8192,

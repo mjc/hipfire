@@ -2477,6 +2477,22 @@ fn llama_config_from_value(
         .head_dim
         .unwrap_or(raw.hidden_size / raw.num_attention_heads);
     let rope_scaling = crate::rope::rope_scaling(config)?;
+    // Top-level `rope_theta` wins. A config that moved the base into
+    // `rope_parameters` or `rope_scaling` still has to use that value; the
+    // serde default of 10000 is only for a checkpoint that names neither.
+    let positive = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_f64)
+            .filter(|theta| theta.is_finite() && *theta > 0.0)
+    };
+    let rope_freq_base = positive(config.get("rope_theta"))
+        .or_else(|| {
+            ["rope_parameters", "rope_scaling"]
+                .into_iter()
+                .find_map(|key| positive(config.get(key).and_then(|block| block.get("rope_theta"))))
+        })
+        .map(|theta| theta as f32)
+        .unwrap_or(raw.rope_theta);
     Ok(LlamaConfig {
         arch,
         dim: raw.hidden_size,
@@ -2488,7 +2504,7 @@ fn llama_config_from_value(
         head_dim,
         norm_eps: raw.rms_norm_eps,
         max_seq_len: raw.max_position_embeddings,
-        rope_freq_base: raw.rope_theta,
+        rope_freq_base,
         rope_scaling,
         bos_token: first_token_or(raw.bos_token_id.as_ref(), 1),
         eos_token: first_token_or(raw.eos_token_id.as_ref(), 2),
@@ -3738,6 +3754,19 @@ mod llama_config_tests {
         assert_eq!(c.rope_scaling, rdna_compute::rope::RopeScaling::None);
         assert!(c.llama3_inv_freq().is_none());
         assert_eq!(c.rope_scaling.context_limit(c.max_seq_len), 8192);
+    }
+
+    #[test]
+    fn nested_rope_theta_is_the_base_when_the_top_level_key_is_absent() {
+        let mut config = llama31_published();
+        config.as_object_mut().unwrap().remove("rope_theta");
+        config["rope_scaling"]["rope_theta"] = serde_json::json!(500000.0);
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(c.rope_freq_base, 500000.0);
+        let mut top = llama31_published();
+        top["rope_scaling"]["rope_theta"] = serde_json::json!(10000.0);
+        let c = llama_config_from_value(&top, false).unwrap();
+        assert_eq!(c.rope_freq_base, 500000.0);
     }
 
     #[test]

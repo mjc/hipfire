@@ -1437,7 +1437,18 @@ impl Gpu {
             ));
         }
         let buf = self.hip.malloc(bytes.len())?;
-        self.hip.memcpy_htod(&buf, &bytes)?;
+        if let Err(err) = self.hip.memcpy_htod(&buf, &bytes) {
+            let _ = self.hip.free(buf);
+            return Err(err);
+        }
+        // `DeviceBuffer` does not free on drop. Release the previous
+        // allocation after the new upload succeeds.
+        if let Some(old) = self.scratch.rope_inv_freq.take() {
+            if let Err(err) = self.hip.free(old) {
+                let _ = self.hip.free(buf);
+                return Err(err);
+            }
+        }
         let ptr = buf.as_ptr();
         self.scratch.rope_inv_freq = Some(buf);
         self.scratch.rope_inv_freq_host = bytes;
