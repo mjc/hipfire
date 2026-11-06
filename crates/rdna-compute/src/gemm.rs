@@ -3251,6 +3251,59 @@ impl Gpu {
 
     /// MQ3-Lloyd residual GEMV with engine-side x rotation.
 
+    /// gfx1010 scalar Lloyd-MQ3 GEMM. Input is F32 and already FWHT-rotated.
+    /// `add` selects residual accumulation; otherwise the output is overwritten.
+    pub fn gemm_mq3_lloyd_gfx1010(
+        &mut self,
+        weights: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        assert!(self.arch_caps.is_gfx1010());
+        assert_eq!(k % 256, 0);
+        self.bind_thread()?;
+        let name = if add {
+            "gemm_mq3g256_lloyd_residual_gfx1010"
+        } else {
+            "gemm_mq3g256_lloyd_gfx1010"
+        };
+        self.ensure_kernel(
+            name,
+            include_str!("../../../kernels/src/gemm_mq3g256_lloyd_residual.gfx1010.hip"),
+            name,
+        )?;
+        let mut ap = weights.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mv = m as i32;
+        let mut kv = k as i32;
+        let mut nv = batch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            name,
+            m * (k / 256) * LLOYD_MQ3_GROUP_BYTES + batch * (k + m) * 4,
+        );
+        let result = launch_params_blob!(self, name, [m as u32, batch.div_ceil(8) as u32, 1],
+            [32, 1, 1], 0, params; ap, xp, yp, mv, kv, nv);
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// MQ3-Lloyd WMMA residual GEMM (Phase 5 / issue #116, Phase B1).
     /// Mirrors `gemm_hfq3g256_residual_wmma` shape + grid; group stride is 112 B
     /// (16 B fp16 codebook + 96 B 3-bit indices) instead of HFQ3's 104. K must

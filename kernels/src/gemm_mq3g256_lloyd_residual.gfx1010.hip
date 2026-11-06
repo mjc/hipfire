@@ -6,7 +6,8 @@
 
 #define BATCH_TILE 8
 
-extern "C" __global__ __launch_bounds__(32, 6) void gemm_mq3g256_lloyd_residual_gfx1010(
+template <bool Add>
+__device__ void lloyd_mq3_gemm(
     const char* __restrict__ weights, const float* __restrict__ input,
     float* __restrict__ output, int rows, int k, int batch_size
 ) {
@@ -42,6 +43,22 @@ extern "C" __global__ __launch_bounds__(32, 6) void gemm_mq3g256_lloyd_residual_
         float value = sum[b];
         for (int offset = 16; offset > 0; offset >>= 1)
             value += __shfl_down(value, offset);
-        if (lane == 0) output[(long long)(batch_start + b) * rows + row] += value;
+        if (lane == 0) {
+            const long long index = (long long)(batch_start + b) * rows + row;
+            if (Add) output[index] += value;
+            else output[index] = value;
+        }
     }
+}
+
+extern "C" __global__ __launch_bounds__(32, 6) void gemm_mq3g256_lloyd_residual_gfx1010(
+    const char* weights, const float* input, float* output, int rows, int k, int batch_size
+) {
+    lloyd_mq3_gemm<true>(weights, input, output, rows, k, batch_size);
+}
+
+extern "C" __global__ __launch_bounds__(32, 6) void gemm_mq3g256_lloyd_gfx1010(
+    const char* weights, const float* input, float* output, int rows, int k, int batch_size
+) {
+    lloyd_mq3_gemm<false>(weights, input, output, rows, k, batch_size);
 }

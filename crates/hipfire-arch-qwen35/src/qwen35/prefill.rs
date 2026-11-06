@@ -4146,7 +4146,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // Routes the four LA + FA matchers below to the new non-WMMA kernels
     // (gemm_qkv_hfq3g256, gemm_qkvza_hfq3g256, gemm_gate_up_hfq3g256,
     // gemm_hfq3g256_residual). Lloyd-MQ3 stays gated on gfx11+ — no
-    // gfx10 Lloyd port (separate larger project).
+    // gfx1010 Lloyd uses the scalar batched projection path.
     let mq3_uniform_with_gfx10_scalar = matches!(dt, DType::MQ3G256)
         && matches!(
             arch,
@@ -4171,6 +4171,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
                 | "gfx1201"
         );
 
+    // gfx1010 uses F32 scalar projections; gfx11/12 use WMMA.
     // Lloyd-MQ3 (MQ3G256Lloyd): Phase 5 of issue #116 ships the
     // gemm_*_mq3g256_lloyd_wmma family alongside the existing HFQ3 WMMA
     // path; group stride differs (112 B Lloyd vs 104 B HFQ3) so dispatch
@@ -4180,7 +4181,14 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let lloyd_mq3_with_wmma = matches!(dt, DType::MQ3G256Lloyd)
         && matches!(
             arch,
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
+            "gfx1010"
+                | "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1200"
+                | "gfx1201"
         );
 
     // Lloyd-MQ4 (MQ4G256Lloyd): shipped as part of issue #182.
@@ -8413,12 +8421,15 @@ mod tests {
     fn qwen35_is_batchable_la_lloyd_mq3_mq4_on_gfx11_and_gfx12() {
         // MQ3-Lloyd admits gfx1100/1101/1102/1150/1151 — the MQ3-Lloyd GEMM
         // source selectors DO ship a gfx1150 kernel.
-        for &arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"] {
+        for &arch in &[
+            "gfx1010", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151",
+        ] {
             assert!(
                 is_batchable_la(DType::MQ3G256Lloyd, arch),
                 "MQ3G256Lloyd should batch on {arch}"
             );
         }
+        assert!(!is_batchable_la(DType::MQ3G256Lloyd, "gfx1030"));
         // MQ4-Lloyd admits gfx1100/1101/1102/1151 ONLY (NOT gfx1150). ANTIBLEED
         // admit-vs-select fix: the MQ4-Lloyd GEMM source selectors panic on
         // gfx1150 (no kernel), so admitting it upstream would crash at lookup.
