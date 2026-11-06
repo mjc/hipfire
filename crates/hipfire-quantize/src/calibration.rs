@@ -1840,6 +1840,37 @@ pub(crate) fn config_json_from_gguf(
     if arch_id == 13 {
         apply_gemma4_fields(gguf, prefix, &mut cfg);
     }
+    // llama.cpp 6c01da62 (2026-11-06) does not store Llama 3 low/high
+    // frequency factors. RopeScalingType is none/linear/yarn/longrope, and
+    // LlamaModel.generate_extra_tensors bakes the blend into rope_freqs.
+    // Emit the HF block only when this file actually has factor,
+    // low_freq_factor, high_freq_factor, and original_context_length, and
+    // the scaling type is absent or "llama3". A missing factor is omitted.
+    if arch_str == "llama" {
+        let type_key = format!("{prefix}.rope.scaling.type");
+        let declared = gguf.metadata.get(&type_key).and_then(|v| v.as_str());
+        let type_ok = declared.is_none() || declared == Some("llama3");
+        if type_ok {
+            let factor = read_f(&format!("{prefix}.rope.scaling.factor"));
+            let low = read_f(&format!("{prefix}.rope.scaling.low_freq_factor"));
+            let high = read_f(&format!("{prefix}.rope.scaling.high_freq_factor"));
+            let original = read_u(&format!("{prefix}.rope.scaling.original_context_length"));
+            if let (Some(factor), Some(low), Some(high), Some(original)) =
+                (factor, low, high, original)
+            {
+                cfg.insert(
+                    "rope_scaling".to_string(),
+                    serde_json::json!({
+                        "rope_type": "llama3",
+                        "factor": factor,
+                        "low_freq_factor": low,
+                        "high_freq_factor": high,
+                        "original_max_position_embeddings": original,
+                    }),
+                );
+            }
+        }
+    }
     cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
     cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
     serde_json::Value::Object(cfg)
@@ -2275,9 +2306,83 @@ mod gemma4_config_tests {
         let cfg = config_json_from_gguf(&gguf, "llama", 0);
         assert!(cfg.get("layer_types").is_none());
         assert!(cfg.get("rope_parameters").is_none());
+        assert!(cfg.get("rope_scaling").is_none());
         assert!(cfg.get("attention_k_eq_v").is_none());
         assert_eq!(cfg["num_key_value_heads"].as_u64(), Some(8));
         assert_eq!(cfg["head_dim"].as_u64(), Some(128));
+    }
+
+    fn llama31_scaling_meta(include_freq_factors: bool) -> HashMap<String, MetaValue> {
+        let mut m = HashMap::new();
+        m.insert("llama.embedding_length".into(), MetaValue::U32(4096));
+        m.insert("llama.block_count".into(), MetaValue::U32(32));
+        m.insert("llama.attention.head_count".into(), MetaValue::U32(32));
+        m.insert("llama.attention.head_count_kv".into(), MetaValue::U32(8));
+        m.insert("llama.feed_forward_length".into(), MetaValue::U32(14336));
+        m.insert("llama.vocab_size".into(), MetaValue::U32(128256));
+        m.insert("llama.context_length".into(), MetaValue::U32(131072));
+        m.insert("llama.rope.freq_base".into(), MetaValue::F32(500000.0));
+        m.insert(
+            "llama.rope.scaling.type".into(),
+            MetaValue::String("llama3".into()),
+        );
+        m.insert("llama.rope.scaling.factor".into(), MetaValue::F32(8.0));
+        m.insert(
+            "llama.rope.scaling.original_context_length".into(),
+            MetaValue::U32(8192),
+        );
+        if include_freq_factors {
+            m.insert(
+                "llama.rope.scaling.low_freq_factor".into(),
+                MetaValue::F32(1.0),
+            );
+            m.insert(
+                "llama.rope.scaling.high_freq_factor".into(),
+                MetaValue::F32(4.0),
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn llama_gguf_llama3_keys_write_hf_rope_scaling() {
+        let gguf = GgufFile::for_tests(llama31_scaling_meta(true), vec![]).unwrap();
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
+        let rope = &cfg["rope_scaling"];
+        assert_eq!(rope["rope_type"].as_str(), Some("llama3"));
+        assert_eq!(rope["factor"].as_f64(), Some(8.0));
+        assert_eq!(rope["low_freq_factor"].as_f64(), Some(1.0));
+        assert_eq!(rope["high_freq_factor"].as_f64(), Some(4.0));
+        assert_eq!(
+            rope["original_max_position_embeddings"].as_u64(),
+            Some(8192)
+        );
+        assert_eq!(cfg["rope_theta"].as_f64(), Some(500000.0));
+        assert_eq!(cfg["max_position_embeddings"].as_u64(), Some(131072));
+        let scaling = hipfire_runtime::rope::rope_scaling(&cfg).unwrap();
+        match scaling {
+            rdna_compute::rope::RopeScaling::Llama3(s) => {
+                assert_eq!(
+                    (
+                        s.factor,
+                        s.low_freq_factor,
+                        s.high_freq_factor,
+                        s.original_max_position_embeddings
+                    ),
+                    (8.0, 1.0, 4.0, 8192)
+                );
+                assert_eq!(scaling.context_limit(131_072), 131_072);
+            }
+            other => panic!("expected llama3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn llama_gguf_missing_freq_factors_omits_rope_scaling() {
+        let gguf = GgufFile::for_tests(llama31_scaling_meta(false), vec![]).unwrap();
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
+        assert!(cfg.get("rope_scaling").is_none());
+        assert_eq!(cfg["rope_theta"].as_f64(), Some(500000.0));
     }
 
     /// gemma4_text is a distinct GGUF architecture string that still maps to

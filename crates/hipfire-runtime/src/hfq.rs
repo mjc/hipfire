@@ -2476,6 +2476,7 @@ fn llama_config_from_value(
     let head_dim = raw
         .head_dim
         .unwrap_or(raw.hidden_size / raw.num_attention_heads);
+    let rope_scaling = crate::rope::rope_scaling(config)?;
     Ok(LlamaConfig {
         arch,
         dim: raw.hidden_size,
@@ -2488,6 +2489,7 @@ fn llama_config_from_value(
         norm_eps: raw.rms_norm_eps,
         max_seq_len: raw.max_position_embeddings,
         rope_freq_base: raw.rope_theta,
+        rope_scaling,
         bos_token: first_token_or(raw.bos_token_id.as_ref(), 1),
         eos_token: first_token_or(raw.eos_token_id.as_ref(), 2),
         has_qk_norm,
@@ -3569,6 +3571,8 @@ mod llama_config_tests {
         assert_eq!(c.norm_eps, 1e-6);
         assert_eq!(c.max_seq_len, 8192);
         assert_eq!(c.rope_freq_base, 500000.0);
+        assert_eq!(c.rope_scaling, rdna_compute::rope::RopeScaling::None);
+        assert!(c.llama3_inv_freq().is_none());
         assert_eq!(c.bos_token, 128000);
         assert_eq!(c.eos_token, 128001);
         assert!(!c.has_qk_norm);
@@ -3605,6 +3609,7 @@ mod llama_config_tests {
         assert_eq!(c.norm_eps, 1e-5);
         assert_eq!(c.max_seq_len, 2048);
         assert_eq!(c.rope_freq_base, 10000.0);
+        assert_eq!(c.rope_scaling, rdna_compute::rope::RopeScaling::None);
         assert_eq!(c.bos_token, 1);
         assert_eq!(c.eos_token, 2);
         assert_eq!(c.n_kv_heads, 32); // defaults to n_heads
@@ -3650,6 +3655,98 @@ mod llama_config_tests {
         let config = envelope.get("config").unwrap();
         let c = llama_config_from_value(config, true).unwrap();
         assert!(c.has_qk_norm);
+    }
+
+    fn llama31_published() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "intermediate_size": 14336,
+            "vocab_size": 128256,
+            "rms_norm_eps": 1e-5,
+            "max_position_embeddings": 131072,
+            "rope_theta": 500000.0,
+            "attention_bias": false,
+            "tie_word_embeddings": false,
+            "hidden_act": "silu",
+            "rope_scaling": {
+                "factor": 8.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192,
+                "rope_type": "llama3"
+            }
+        })
+    }
+
+    #[test]
+    fn llama31_published_config_uses_llama3_frequencies() {
+        let c = llama_config_from_value(&llama31_published(), false).unwrap();
+        assert_eq!(c.dim, 4096);
+        assert_eq!(c.n_layers, 32);
+        assert_eq!(c.n_heads, 32);
+        assert_eq!(c.n_kv_heads, 8);
+        assert_eq!(c.hidden_dim, 14336);
+        assert_eq!(c.vocab_size, 128256);
+        assert_eq!(c.head_dim, 128);
+        assert_eq!(c.norm_eps, 1e-5);
+        assert_eq!(c.rope_freq_base, 500000.0);
+        assert_eq!(c.max_seq_len, 131072);
+        assert!(!c.has_qk_norm);
+        match c.rope_scaling {
+            rdna_compute::rope::RopeScaling::Llama3(s) => {
+                assert_eq!(
+                    (
+                        s.factor,
+                        s.low_freq_factor,
+                        s.high_freq_factor,
+                        s.original_max_position_embeddings
+                    ),
+                    (8.0, 1.0, 4.0, 8192)
+                );
+                assert_eq!(c.rope_scaling.context_limit(c.max_seq_len), 131072);
+                assert_ne!(
+                    c.rope_scaling.context_limit(c.max_seq_len),
+                    (8192.0_f64 * 8.0) as usize
+                );
+            }
+            other => panic!("expected llama3, got {other:?}"),
+        }
+        let freq = c.llama3_inv_freq().expect("llama3 table");
+        assert_eq!(freq.len(), 64);
+        // Literals from the wavelength blend, not from Rope::inv_freq.
+        assert!((f64::from(freq[0]) - 1.0).abs() < 1e-6);
+        assert!((f64::from(freq[29]) - 0.0021665707635033591).abs() < 1e-8);
+        assert!((f64::from(freq[32]) - 0.00052484616099295468).abs() < 1e-9);
+        assert!((f64::from(freq[63]) - 3.0689259889145111e-7).abs() < 1e-12);
+        let plain_long = 500_000.0_f32.powf(-((2 * 63) as f32) / 128.0);
+        assert!((freq[0] - 1.0).abs() < 1e-6);
+        assert!((freq[63] - plain_long).abs() > 1e-9);
+    }
+
+    #[test]
+    fn null_rope_scaling_stays_on_the_unscaled_schedule() {
+        let mut config = llama31_published();
+        config["rope_scaling"] = serde_json::Value::Null;
+        config["max_position_embeddings"] = serde_json::json!(8192);
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(c.max_seq_len, 8192);
+        assert_eq!(c.rope_freq_base, 500000.0);
+        assert_eq!(c.rope_scaling, rdna_compute::rope::RopeScaling::None);
+        assert!(c.llama3_inv_freq().is_none());
+        assert_eq!(c.rope_scaling.context_limit(c.max_seq_len), 8192);
+    }
+
+    #[test]
+    fn unknown_rope_type_fails_llama_load() {
+        let mut config = llama31_published();
+        config["rope_scaling"]["rope_type"] = serde_json::json!("longrope");
+        let err = llama_config_from_value(&config, false).unwrap_err();
+        assert!(err.contains("longrope"), "{err}");
+        assert!(err.contains("llama3"), "{err}");
     }
 }
 

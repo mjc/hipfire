@@ -23,6 +23,19 @@ pub enum RopeScaling {
     #[default]
     None,
     Yarn(Yarn),
+    /// Hugging Face Llama 3 wavelength blend (`rope_type: "llama3"`).
+    /// Attention scale stays 1. This is not YaRN: the blend is linear in
+    /// wavelength, and [`RopeScaling::context_limit`] is the checkpoint window.
+    Llama3(Llama3),
+}
+
+/// Llama 3 RoPE scaling (`_compute_llama3_parameters`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Llama3 {
+    pub factor: f64,
+    pub low_freq_factor: f64,
+    pub high_freq_factor: f64,
+    pub original_max_position_embeddings: usize,
 }
 
 /// YaRN parameters, with HF `_compute_yarn_parameters` defaults resolved.
@@ -75,11 +88,11 @@ impl Yarn {
 }
 
 impl RopeScaling {
-    /// Positions the scaled embedding covers: `factor x original` under YaRN,
-    /// otherwise the checkpoint's `max_position_embeddings`.
+    /// Positions the scaled embedding covers: `factor x original` under YaRN.
+    /// Llama 3 and unscaled RoPE use the checkpoint's `max_position_embeddings`.
     pub fn context_limit(&self, max_position_embeddings: usize) -> usize {
         match self {
-            Self::None => max_position_embeddings,
+            Self::None | Self::Llama3(_) => max_position_embeddings,
             Self::Yarn(y) => (y.original_max_position_embeddings as f64 * y.factor) as usize,
         }
     }
@@ -137,8 +150,9 @@ impl Rope {
     /// Kernel argument for a rotary width of `rotary_dim` channels
     /// (`rotary_dim / 2` frequency pairs).
     pub fn yarn(&self, rotary_dim: usize) -> RopeYarn {
-        let RopeScaling::Yarn(y) = self.scaling else {
-            return RopeYarn::OFF;
+        let y = match self.scaling {
+            RopeScaling::Yarn(y) => y,
+            RopeScaling::None | RopeScaling::Llama3(_) => return RopeYarn::OFF,
         };
         // HF find_correction_range (truncate = true).
         let dim = rotary_dim as f64;
@@ -158,28 +172,58 @@ impl Rope {
         }
     }
 
-    /// Host reference of the scaled inverse frequencies (HF
-    /// `_compute_yarn_parameters` / default RoPE) and the cos/sin multiplier.
+    /// Host reference of the scaled inverse frequencies and the cos/sin
+    /// multiplier. YaRN follows `_compute_yarn_parameters`. Llama 3 follows
+    /// `_compute_llama3_parameters` and keeps the multiplier at 1.
     pub fn inv_freq(&self, rotary_dim: usize) -> (Vec<f64>, f64) {
-        let args = self.yarn(rotary_dim);
-        let freqs = (0..rotary_dim / 2)
-            .map(|pair| {
-                let extrapolation = self.theta.powf(-((2 * pair) as f64) / rotary_dim as f64);
-                let RopeScaling::Yarn(y) = self.scaling else {
-                    return extrapolation;
-                };
-                let (low, high) = (args.corr_low as f64, args.corr_high as f64);
-                let span = if high == low { 0.001 } else { high - low };
-                let ramp = ((pair as f64 - low) / span).clamp(0.0, 1.0);
-                extrapolation / y.factor * ramp + extrapolation * (1.0 - ramp)
-            })
-            .collect();
-        let mscale = match self.scaling {
-            RopeScaling::None => 1.0,
-            RopeScaling::Yarn(y) => y.attention_factor,
-        };
-        (freqs, mscale)
+        match self.scaling {
+            RopeScaling::None => (plain_inv_freq(self.theta, rotary_dim), 1.0),
+            RopeScaling::Yarn(y) => {
+                let args = self.yarn(rotary_dim);
+                let freqs = (0..rotary_dim / 2)
+                    .map(|pair| {
+                        let extrapolation =
+                            self.theta.powf(-((2 * pair) as f64) / rotary_dim as f64);
+                        let (low, high) = (args.corr_low as f64, args.corr_high as f64);
+                        let span = if high == low { 0.001 } else { high - low };
+                        let ramp = ((pair as f64 - low) / span).clamp(0.0, 1.0);
+                        extrapolation / y.factor * ramp + extrapolation * (1.0 - ramp)
+                    })
+                    .collect();
+                (freqs, y.attention_factor)
+            }
+            RopeScaling::Llama3(s) => (llama3_inv_freq(self.theta, rotary_dim, s), 1.0),
+        }
     }
+}
+
+fn plain_inv_freq(theta: f64, rotary_dim: usize) -> Vec<f64> {
+    (0..rotary_dim / 2)
+        .map(|pair| theta.powf(-((2 * pair) as f64) / rotary_dim as f64))
+        .collect()
+}
+
+/// HF `_compute_llama3_parameters`: short wavelengths stay, long wavelengths
+/// divide by `factor`, and the band between is linear in wavelength.
+fn llama3_inv_freq(theta: f64, rotary_dim: usize, s: Llama3) -> Vec<f64> {
+    let original = s.original_max_position_embeddings as f64;
+    let low_wavelen = original / s.low_freq_factor;
+    let high_wavelen = original / s.high_freq_factor;
+    (0..rotary_dim / 2)
+        .map(|pair| {
+            let inv_freq = 1.0 / theta.powf((2 * pair) as f64 / rotary_dim as f64);
+            let wavelen = 2.0 * std::f64::consts::PI / inv_freq;
+            if wavelen < high_wavelen {
+                inv_freq
+            } else if wavelen > low_wavelen {
+                inv_freq / s.factor
+            } else {
+                let smooth = (original / wavelen - s.low_freq_factor)
+                    / (s.high_freq_factor - s.low_freq_factor);
+                (1.0 - smooth) * (inv_freq / s.factor) + smooth * inv_freq
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -232,5 +276,97 @@ mod tests {
         assert_eq!(y.attention_factor, 1.0);
         let y = Yarn::new(4.0, 4096, None, None, Some(1.5), None);
         assert_eq!(y.attention_factor, 1.5);
+    }
+
+    /// Llama 3.1 8B (theta 500000, head dim 128, factor 8, low 1, high 4,
+    /// original 8192). Expected frequencies are computed here from the
+    /// wavelength blend, not from [`Rope::inv_freq`].
+    fn expected_llama3_inv_freq(rotary_dim: usize) -> Vec<f64> {
+        const THETA: f64 = 500_000.0;
+        const FACTOR: f64 = 8.0;
+        const LOW: f64 = 1.0;
+        const HIGH: f64 = 4.0;
+        const ORIGINAL: f64 = 8192.0;
+        let low_wavelen = ORIGINAL / LOW;
+        let high_wavelen = ORIGINAL / HIGH;
+        (0..rotary_dim / 2)
+            .map(|pair| {
+                let inv_freq = 1.0 / THETA.powf((2 * pair) as f64 / rotary_dim as f64);
+                let wavelen = 2.0 * std::f64::consts::PI / inv_freq;
+                if wavelen < high_wavelen {
+                    inv_freq
+                } else if wavelen > low_wavelen {
+                    inv_freq / FACTOR
+                } else {
+                    let smooth = (ORIGINAL / wavelen - LOW) / (HIGH - LOW);
+                    (1.0 - smooth) * (inv_freq / FACTOR) + smooth * inv_freq
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn llama3_inv_freq_follows_the_wavelength_blend() {
+        let scaling = RopeScaling::Llama3(Llama3 {
+            factor: 8.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 8192,
+        });
+        let rope = Rope {
+            theta: 500_000.0,
+            scaling,
+        };
+        let expected = expected_llama3_inv_freq(128);
+        // Independent literals for the shortest pair, a medium pair, and the longest.
+        assert!((expected[0] - 1.0).abs() < 1e-15);
+        assert!((expected[29] - 0.0021665707635033591).abs() < 1e-18);
+        assert!((expected[32] - 0.00052484616099295468).abs() < 1e-18);
+        assert!((expected[63] - 3.0689259889145111e-7).abs() < 1e-22);
+        let (freqs, scale) = rope.inv_freq(128);
+        assert_eq!(scale, 1.0);
+        assert_eq!(freqs.len(), expected.len());
+        for (got, want) in freqs.iter().zip(&expected) {
+            assert!(
+                (got - want).abs() <= 1e-18 * want.abs().max(1.0),
+                "{got} vs {want}"
+            );
+        }
+        // The schedule rescales inv_freq itself, so both positions share one
+        // table: angle / position recovers that entry.
+        for &pos in &[4096.0_f64, 9000.0] {
+            for (pair, &freq) in freqs.iter().enumerate() {
+                let angle = pos * freq;
+                let back = angle / pos;
+                assert!(
+                    (back - freq).abs() <= 8.0 * f64::EPSILON * freq.abs().max(1.0),
+                    "pair {pair} pos {pos}: {back} vs {freq}"
+                );
+            }
+        }
+        let plain = |pair: usize| 500_000.0_f64.powf(-((2 * pair) as f64) / 128.0);
+        let pos = 9000.0_f64;
+        let short = pos * freqs[0];
+        let short_plain = pos * plain(0);
+        assert!((short.sin() - short_plain.sin()).abs() < 1e-12);
+        assert!((short.cos() - short_plain.cos()).abs() < 1e-12);
+        let long = pos * freqs[63];
+        let long_plain = pos * plain(63);
+        assert!((long.sin() - long_plain.sin()).abs() > 1e-6);
+        assert!((long.cos() - long_plain.cos()).abs() > 1e-6);
+        // Context is the checkpoint window, not factor * original (65536).
+        assert_eq!(scaling.context_limit(131_072), 131_072);
+        assert_ne!(scaling.context_limit(131_072), (8192.0_f64 * 8.0) as usize);
+
+        let unscaled = Rope {
+            theta: 500_000.0,
+            scaling: RopeScaling::None,
+        };
+        let (plain_freqs, plain_scale) = unscaled.inv_freq(128);
+        assert_eq!(plain_scale, 1.0);
+        assert_eq!(unscaled.scaling.context_limit(8192), 8192);
+        for (pair, got) in plain_freqs.iter().enumerate() {
+            assert!((got - plain(pair)).abs() <= 1e-18 * plain(pair).max(1.0));
+        }
     }
 }

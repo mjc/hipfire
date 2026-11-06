@@ -7,7 +7,7 @@
 //! `attention.yarn_factor` override applied. Families call [`rope_scaling`]
 //! and pass the result through as part of an [`rdna_compute::rope::Rope`].
 
-use rdna_compute::rope::{RopeScaling, Yarn};
+use rdna_compute::rope::{Llama3, RopeScaling, Yarn};
 use serde_json::Value;
 
 /// The RoPE scaling `text_config` declares, overridden by
@@ -27,12 +27,17 @@ fn resolve(text: &Value, yarn_factor: Option<f64>) -> Result<RopeScaling, String
         .and_then(|p| p.get("rope_type").or_else(|| p.get("type")))
         .and_then(Value::as_str)
         .unwrap_or("default");
+    if kind == "llama3" {
+        // `attention.yarn_factor` rewrites YaRN only. Llama 3 stays on its
+        // wavelength blend, and missing factors are not filled in.
+        return llama3_scaling(params);
+    }
     let declared_yarn = match kind {
         "default" => false,
         "yarn" => true,
         other => {
             return Err(format!(
-                "unsupported rope_type {other:?} (supported: default, yarn)"
+                "unsupported rope_type {other:?} (supported: default, yarn, llama3)"
             ))
         }
     };
@@ -79,6 +84,33 @@ fn resolve(text: &Value, yarn_factor: Option<f64>) -> Result<RopeScaling, String
     )))
 }
 
+fn llama3_scaling(params: Option<&Value>) -> Result<RopeScaling, String> {
+    let float = |key: &str| params.and_then(|p| p.get(key)).and_then(Value::as_f64);
+    let factor = float("factor").ok_or("llama3 rope needs factor")?;
+    let low = float("low_freq_factor").ok_or("llama3 rope needs low_freq_factor")?;
+    let high = float("high_freq_factor").ok_or("llama3 rope needs high_freq_factor")?;
+    let original = params
+        .and_then(|p| p.get("original_max_position_embeddings"))
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n > 0)
+        .ok_or("llama3 rope needs original_max_position_embeddings")?;
+    if !(factor.is_finite() && factor >= 1.0) {
+        return Err(format!("llama3 factor {factor} must be finite and >= 1"));
+    }
+    if !(low.is_finite() && high.is_finite()) || high == low {
+        return Err(format!(
+            "llama3 low_freq_factor {low} and high_freq_factor {high} must be finite and differ"
+        ));
+    }
+    Ok(RopeScaling::Llama3(Llama3 {
+        factor,
+        low_freq_factor: low,
+        high_freq_factor: high,
+        original_max_position_embeddings: original,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,7 +123,7 @@ mod tests {
     fn yarn(scaling: RopeScaling) -> Yarn {
         match scaling {
             RopeScaling::Yarn(y) => y,
-            RopeScaling::None => panic!("expected YaRN"),
+            RopeScaling::None | RopeScaling::Llama3(_) => panic!("expected YaRN"),
         }
     }
 
@@ -153,5 +185,52 @@ mod tests {
         // A shrinking factor would invert the ramp and the context limit.
         let shrink = qwen38(json!({"rope_type": "yarn", "factor": 0.5}));
         assert!(resolve(&shrink, None).unwrap_err().contains(">= 1"));
+    }
+
+    fn llama31() -> Value {
+        json!({
+            "max_position_embeddings": 131072,
+            "rope_theta": 500000.0,
+            "rope_scaling": {
+                "factor": 8.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192,
+                "rope_type": "llama3"
+            }
+        })
+    }
+
+    #[test]
+    fn llama3_scaling_is_not_yarn_and_does_not_invent_factors() {
+        let scaling = resolve(&llama31(), Some(4.0)).unwrap();
+        match scaling {
+            RopeScaling::Llama3(s) => {
+                assert_eq!(
+                    (
+                        s.factor,
+                        s.low_freq_factor,
+                        s.high_freq_factor,
+                        s.original_max_position_embeddings
+                    ),
+                    (8.0, 1.0, 4.0, 8192)
+                );
+                assert_eq!(RopeScaling::Llama3(s).context_limit(131_072), 131_072);
+            }
+            other => panic!("expected llama3, got {other:?}"),
+        }
+        let mut missing = llama31();
+        missing["rope_scaling"]
+            .as_object_mut()
+            .unwrap()
+            .remove("high_freq_factor");
+        let err = resolve(&missing, None).unwrap_err();
+        assert!(err.contains("high_freq_factor"), "{err}");
+        let unscaled = json!({
+            "rope_theta": 500000.0,
+            "max_position_embeddings": 8192,
+            "rope_scaling": null
+        });
+        assert_eq!(resolve(&unscaled, None).unwrap(), RopeScaling::None);
     }
 }
