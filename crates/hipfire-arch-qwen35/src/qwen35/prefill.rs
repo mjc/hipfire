@@ -4461,6 +4461,14 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || bf16_with_gfx942
 }
 
+// On gfx1010 the new scalar route consumes every weight in a fused group as
+// Lloyd MQ3. Mixed groups must retain the per-token path.
+fn gfx1010_lloyd_group_batchable(arch: &str, dtypes: &[DType]) -> bool {
+    arch != "gfx1010"
+        || !dtypes.contains(&DType::MQ3G256Lloyd)
+        || dtypes.iter().all(|&dt| dt == DType::MQ3G256Lloyd)
+}
+
 /// Single source of truth for per-layer batchability and checked geometry.
 /// Called by `validate_ep_batch_compatibility`, `prefill_batch_pbs_eligible`,
 /// `fa_batched_ok` guard, and later EP state preflight. Validates every
@@ -4549,6 +4557,21 @@ pub fn qwen35_layer_batch_admissible(
             if l.w_down.m != dim || l.w_down.k != config.hidden_dim {
                 return Err(HipError::new(0, "DeltaNet w_down shape mismatch"));
             }
+            if !gfx1010_lloyd_group_batchable(
+                arch,
+                &[
+                    l.wqkv.gpu_dtype,
+                    l.wz.gpu_dtype,
+                    l.w_beta.gpu_dtype,
+                    l.w_alpha.gpu_dtype,
+                ],
+            ) || !gfx1010_lloyd_group_batchable(arch, &[l.w_gate.gpu_dtype, l.w_up.gpu_dtype])
+            {
+                return Err(HipError::new(
+                    0,
+                    "mixed Lloyd MQ3 projection group is not batchable on gfx1010",
+                ));
+            }
             for (name, dt) in [
                 ("wqkv", l.wqkv.gpu_dtype),
                 ("wz", l.wz.gpu_dtype),
@@ -4601,6 +4624,16 @@ pub fn qwen35_layer_batch_admissible(
             }
             if l.w_down.m != dim || l.w_down.k != config.hidden_dim {
                 return Err(HipError::new(0, "FullAttn w_down shape mismatch"));
+            }
+            if !gfx1010_lloyd_group_batchable(
+                arch,
+                &[l.wq.gpu_dtype, l.wk.gpu_dtype, l.wv.gpu_dtype],
+            ) || !gfx1010_lloyd_group_batchable(arch, &[l.w_gate.gpu_dtype, l.w_up.gpu_dtype])
+            {
+                return Err(HipError::new(
+                    0,
+                    "mixed Lloyd MQ3 projection group is not batchable on gfx1010",
+                ));
             }
             for (name, dt) in [
                 ("wq", l.wq.gpu_dtype),
@@ -8641,6 +8674,17 @@ mod tests {
                 "MFP4G32 must fall back on {arch}"
             );
         }
+    }
+
+    #[test]
+    fn gfx1010_lloyd_groups_reject_mixed_weight_layouts() {
+        let lloyd = DType::MQ3G256Lloyd;
+        let mq4 = DType::MQ4G256;
+        assert!(gfx1010_lloyd_group_batchable("gfx1010", &[lloyd, lloyd]));
+        assert!(gfx1010_lloyd_group_batchable("gfx1010", &[mq4, mq4]));
+        assert!(!gfx1010_lloyd_group_batchable("gfx1010", &[lloyd, mq4]));
+        assert!(!gfx1010_lloyd_group_batchable("gfx1010", &[mq4, lloyd]));
+        assert!(gfx1010_lloyd_group_batchable("gfx1100", &[lloyd, mq4]));
     }
 
     #[test]
