@@ -1441,14 +1441,9 @@ impl Gpu {
             let _ = self.hip.free(buf);
             return Err(err);
         }
-        // `DeviceBuffer` does not free on drop. Release the previous
-        // allocation after the new upload succeeds.
-        if let Some(old) = self.scratch.rope_inv_freq.take() {
-            if let Err(err) = self.hip.free(old) {
-                let _ = self.hip.free(buf);
-                return Err(err);
-            }
-        }
+        // Drop does not call hipFree. Leave the previous allocation in
+        // place: a graph captured before this length change still holds
+        // its pointer after capture ends.
         let ptr = buf.as_ptr();
         self.scratch.rope_inv_freq = Some(buf);
         self.scratch.rope_inv_freq_host = bytes;
