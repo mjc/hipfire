@@ -95,6 +95,11 @@ pub struct DenseLayer<'a> {
 pub trait DenseArch {
     fn n_layers(&self) -> usize;
     fn knobs(&self) -> &DenseKnobs;
+    /// Llama 3 inverse frequencies (`head_dim / 2`). `None` keeps [`Step::Rope`]
+    /// on `knobs.rope_theta`.
+    fn rope_inv_freq(&self) -> Option<&[f32]> {
+        None
+    }
     fn scratch(&self) -> DenseScratch<'_>;
     fn layer(&self, l: usize) -> DenseLayer<'_>;
     /// KV-cache write + single-token attention for layer `l`. By this point q/k/v
@@ -149,6 +154,7 @@ fn shared_input(rot: RotationPlan, x_rot: &GpuTensor) -> (RotationPlan, GemvInpu
 pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -> HipResult<()> {
     let k = arch.knobs();
     let s = arch.scratch();
+    let rope_table = arch.rope_inv_freq().map(|freq| freq.to_vec());
 
     for l in 0..arch.n_layers() {
         let layer = arch.layer(l);
@@ -231,20 +237,36 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
             }
         }
 
-        // RoPE.
-        steps.push(Step::Rope {
-            q: s.q,
-            k: s.k,
-            pos_buf: s.pos_buf,
-            positions: None,
-            n_heads: k.n_heads,
-            n_kv_heads: k.n_kv_heads,
-            head_dim: k.head_dim,
-            rope: Rope {
-                kind: RopeKind::RotateHalf,
-                theta: k.rope_theta,
-            },
-        });
+        // RoPE. Llama 3 frequencies are a host table the theta step cannot
+        // carry, so that path runs the table kernel between the QKV list and
+        // attention. Other arches keep Step::Rope.
+        if let Some(freq) = rope_table.as_deref() {
+            execute_steps(gpu, ctx, &steps).map_err(herr)?;
+            gpu.rope_f32_inv_freq(
+                s.q,
+                s.k,
+                s.pos_buf,
+                k.n_heads,
+                k.n_kv_heads,
+                k.head_dim,
+                freq,
+            )?;
+            steps.clear();
+        } else {
+            steps.push(Step::Rope {
+                q: s.q,
+                k: s.k,
+                pos_buf: s.pos_buf,
+                positions: None,
+                n_heads: k.n_heads,
+                n_kv_heads: k.n_kv_heads,
+                head_dim: k.head_dim,
+                rope: Rope {
+                    kind: RopeKind::RotateHalf,
+                    theta: k.rope_theta,
+                },
+            });
+        }
 
         let o_proj = Step::GemvResidual {
             w: &layer.wo,

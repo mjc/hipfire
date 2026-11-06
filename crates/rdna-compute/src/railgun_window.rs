@@ -468,7 +468,8 @@ impl Gpu {
             ksplit_det_partials,
             sample_partials,
             fa2_q16_scratch,
-            fa2_fp8_q_scratch
+            fa2_fp8_q_scratch,
+            rope_inv_freq
         );
         out
     }

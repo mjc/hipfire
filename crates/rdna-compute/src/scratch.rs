@@ -509,6 +509,11 @@ pub struct ScratchState {
     /// it (same-stream ordering), so no init is needed.
     pub fa2_fp8_q_scratch: Option<DeviceBuffer>,
     pub fa2_fp8_q_scratch_bytes: usize,
+    /// Llama 3 inverse-frequency table (`head_dim / 2` f32). Kept for the Gpu
+    /// lifetime so a captured graph's kernarg pointer stays valid. Replaced
+    /// only when the table length changes and capture is not armed.
+    pub rope_inv_freq: Option<DeviceBuffer>,
+    pub rope_inv_freq_host: Vec<u8>,
     /// Planned-route module barrier (`Gpu::begin_route_kernel_load`). Lives
     /// here so the scratch helpers' `compile_and_load_kernel` calls drain it
     /// too; `Idle` keeps today's lazy loading exactly.

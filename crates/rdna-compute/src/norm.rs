@@ -1396,6 +1396,204 @@ impl Gpu {
         )
     }
 
+    /// Device copy of a Llama 3 inverse-frequency table. The allocation stays
+    /// on this `Gpu` so a later capture records a stable pointer. A same-length
+    /// replacement copies into that allocation; a length change while capture
+    /// or record is armed is refused.
+    fn rope_inv_freq_device(&mut self, host: &[f32]) -> HipResult<*mut c_void> {
+        let mut bytes = Vec::with_capacity(host.len() * 4);
+        for value in host {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        if self.scratch.rope_inv_freq_host == bytes {
+            if let Some(buf) = &self.scratch.rope_inv_freq {
+                return Ok(buf.as_ptr());
+            }
+        }
+        let armed = self.graphs.capture_mode || self.replay.is_recording();
+        let same_len = self
+            .scratch
+            .rope_inv_freq
+            .as_ref()
+            .is_some_and(|buf| buf.size() == bytes.len());
+        if same_len {
+            if armed {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "llama3 RoPE frequencies changed during capture",
+                ));
+            }
+            // SAFETY: the view is used only for this copy and does not outlive
+            // `scratch.rope_inv_freq`.
+            let view = unsafe { self.scratch.rope_inv_freq.as_ref().unwrap().alias() };
+            self.hip.memcpy_htod(&view, &bytes)?;
+            self.scratch.rope_inv_freq_host = bytes;
+            return Ok(self.scratch.rope_inv_freq.as_ref().unwrap().as_ptr());
+        }
+        if armed {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "llama3 RoPE frequencies must be resident before capture",
+            ));
+        }
+        let buf = self.hip.malloc(bytes.len())?;
+        if let Err(err) = self.hip.memcpy_htod(&buf, &bytes) {
+            let _ = self.hip.free(buf);
+            return Err(err);
+        }
+        // Drop does not call hipFree. Leave the previous allocation in
+        // place: a graph captured before this length change still holds
+        // its pointer after capture ends.
+        let ptr = buf.as_ptr();
+        self.scratch.rope_inv_freq = Some(buf);
+        self.scratch.rope_inv_freq_host = bytes;
+        Ok(ptr)
+    }
+
+    /// In-place rotate-half RoPE using a host inverse-frequency table
+    /// (`head_dim / 2` values) instead of a single `freq_base`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_f32_inv_freq(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        inv_freq: &[f32],
+    ) -> HipResult<()> {
+        if inv_freq.len() != head_dim / 2 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "llama3 RoPE table length must be head_dim / 2",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel("rope", kernels::ROPE_SRC, "rope_inv_freq_f32")?;
+        let freq_ptr = self.rope_inv_freq_device(inv_freq)?;
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k.buf.as_ptr();
+        let pos_ptr = pos_buf.as_ptr();
+        let nhq = n_heads_q as i32;
+        let nhk = n_heads_k as i32;
+        let hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &q_ptr as *const _ as *mut c_void,
+            &k_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &freq_ptr as *const _ as *mut c_void,
+            &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+        let half = (head_dim / 2) as u32;
+        let block = 256u32.min(half.max(1));
+        let grid = (half + block - 1) / block;
+        self.launch_maybe_blob(
+            "rope_inv_freq_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_ptr(freq_ptr);
+                b.push_i32(nhq);
+                b.push_i32(nhk);
+                b.push_i32(hd);
+                b
+            },
+        )
+    }
+
+    /// Batched rotate-half RoPE using a host inverse-frequency table.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_batched_f32_inv_freq(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        inv_freq: &[f32],
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if inv_freq.len() != head_dim / 2 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "llama3 RoPE table length must be head_dim / 2",
+            ));
+        }
+        self.bind_thread()?;
+        if batch_size > GRID_Y_ROW_CHUNK {
+            let (q_row, k_row) = (n_heads_q * head_dim * 4, n_heads_k * head_dim * 4);
+            for (r0, rows) in grid_y_row_chunks(batch_size) {
+                self.rope_batched_f32_inv_freq(
+                    &rows_tensor(q, r0, rows, q_row),
+                    &rows_tensor(k, r0, rows, k_row),
+                    &rows_tensor(positions, r0, rows, 4),
+                    n_heads_q,
+                    n_heads_k,
+                    head_dim,
+                    inv_freq,
+                    rows,
+                )?;
+            }
+            return Ok(());
+        }
+        self.ensure_kernel(
+            "rope_batched",
+            kernels::ROPE_BATCHED_SRC,
+            "rope_inv_freq_batched_f32",
+        )?;
+        let freq_ptr = self.rope_inv_freq_device(inv_freq)?;
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut freq = freq_ptr;
+        let mut nhq = n_heads_q as i32;
+        let mut nhk = n_heads_k as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut freq as *mut _ as *mut c_void,
+            &mut nhq as *mut _ as *mut c_void,
+            &mut nhk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let half = (head_dim / 2) as u32;
+        let block = 256u32.min(half.max(1));
+        let grid_x = (half + block - 1) / block;
+        self.launch_maybe_blob(
+            "rope_inv_freq_batched_f32",
+            [grid_x, batch_size as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_ptr(freq_ptr);
+                b.push_i32(nhq);
+                b.push_i32(nhk);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b
+            },
+        )
+    }
+
     // ── DeltaNet ops (feature-gated) ─────────────────────────────────────
 
     /// Partial interleaved RoPE for Qwen3.5 full attention layers.
