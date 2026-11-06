@@ -1039,6 +1039,9 @@ impl Qwen4Config {
             mtp,
             trunk_iu4_default,
         };
+        if let rdna_compute::rope::RopeScaling::Llama3(_) = cfg.rope_scaling {
+            return Err("qwen4: rope_type llama3 is not applied on this architecture".to_string());
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -2923,6 +2926,21 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn llama3_rope_type_is_refused() {
+        let mut raw = fixture();
+        raw["text_config"]["rope_parameters"] = json!({
+            "rope_type": "llama3",
+            "rope_theta": 10000000.0,
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192
+        });
+        let err = Qwen4Config::from_value(&json!({"config": raw})).unwrap_err();
+        assert!(err.contains("llama3"), "{err}");
     }
 
     #[test]

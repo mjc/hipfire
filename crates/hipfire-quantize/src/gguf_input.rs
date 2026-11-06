@@ -179,6 +179,27 @@ impl GgufFile {
         })
     }
 
+    /// Test-only: same metadata view as [`Self::for_tests`], with tensor
+    /// bytes at offset 0. Config translation can read an f32 `rope_freqs`
+    /// table without a real GGUF container.
+    #[cfg(test)]
+    pub fn for_tests_with_data(
+        metadata: HashMap<String, MetaValue>,
+        tensors: Vec<TensorInfo>,
+        data: &[u8],
+    ) -> io::Result<Self> {
+        let mut file = tempfile::tempfile()?;
+        std::io::Write::write_all(&mut file, data)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(Self {
+            version: 3,
+            metadata,
+            tensors,
+            tensor_data_offset: 0,
+            mmap,
+        })
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -255,6 +276,15 @@ impl GgufFile {
         let start = self.tensor_data_offset + info.offset;
         let end = start + info.byte_size();
         &self.mmap[start..end]
+    }
+
+    /// Like [`Self::tensor_data`], but `None` when the declared extent is
+    /// outside the mapped payload. Callers that can skip a tensor use this
+    /// instead of panicking on a truncated file.
+    pub fn tensor_data_checked(&self, info: &TensorInfo) -> Option<&[u8]> {
+        let start = self.tensor_data_offset.checked_add(info.offset)?;
+        let end = start.checked_add(info.byte_size())?;
+        self.mmap.get(start..end)
     }
 
     pub fn meta(&self, key: &str) -> Option<&MetaValue> {

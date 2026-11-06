@@ -3094,6 +3094,8 @@ impl Gpu {
                 fa2_q16_scratch_bytes: 0,
                 fa2_fp8_q_scratch: None,
                 fa2_fp8_q_scratch_bytes: 0,
+                rope_inv_freq: None,
+                rope_inv_freq_host: Vec::new(),
                 route_load: Default::default(),
                 pm_decode,
             },

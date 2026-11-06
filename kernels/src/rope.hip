@@ -39,3 +39,41 @@ extern "C" __global__ void rope_f32(
         k[base + i + half] = k0 * sin_val + k1 * cos_val;
     }
 }
+
+// Llama 3 RoPE. `inv_freq` is head_dim/2 host-scaled frequencies. The
+// rotate-half pairing matches rope_f32; only the frequency source differs.
+extern "C" __global__ void rope_inv_freq_f32(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const int* __restrict__ pos_buf,
+    const float* __restrict__ inv_freq,
+    int n_heads_q,
+    int n_heads_k,
+    int head_dim
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = head_dim / 2;
+    if (i >= half) return;
+
+    int pos = pos_buf[0];
+    float freq = inv_freq[i];
+    float val = (float)pos * freq;
+    float cos_val = cosf(val);
+    float sin_val = sinf(val);
+
+    for (int h = 0; h < n_heads_q; h++) {
+        int base = h * head_dim;
+        float q0 = q[base + i];
+        float q1 = q[base + i + half];
+        q[base + i]        = q0 * cos_val - q1 * sin_val;
+        q[base + i + half] = q0 * sin_val + q1 * cos_val;
+    }
+
+    for (int h = 0; h < n_heads_k; h++) {
+        int base = h * head_dim;
+        float k0 = k[base + i];
+        float k1 = k[base + i + half];
+        k[base + i]        = k0 * cos_val - k1 * sin_val;
+        k[base + i + half] = k0 * sin_val + k1 * cos_val;
+    }
+}

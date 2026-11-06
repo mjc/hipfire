@@ -1259,6 +1259,7 @@ mod tests {
             norm_eps: 1e-5,
             max_seq_len: 32,
             rope_freq_base: 10_000.0,
+            rope_scaling: rdna_compute::rope::RopeScaling::None,
             bos_token: 1,
             eos_token: 2,
             has_qk_norm: false,

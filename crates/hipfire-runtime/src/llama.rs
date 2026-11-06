@@ -37,6 +37,9 @@ pub struct LlamaConfig {
     pub norm_eps: f32,
     pub max_seq_len: usize,
     pub rope_freq_base: f32,
+    /// `None` and YaRN stay on the single-base RoPE launcher. `Llama3` is the
+    /// per-pair frequency table those launchers read.
+    pub rope_scaling: rdna_compute::rope::RopeScaling,
     pub bos_token: u32,
     pub eos_token: u32,
     pub has_qk_norm: bool, // Qwen3 feature
@@ -98,10 +101,96 @@ impl LlamaConfig {
             norm_eps,
             max_seq_len,
             rope_freq_base,
+            // Native GGUF serve does not read Llama 3 scaling metadata.
+            rope_scaling: rdna_compute::rope::RopeScaling::None,
             bos_token,
             eos_token,
             has_qk_norm,
         })
+    }
+
+    /// Llama 3 inverse frequencies for `head_dim`, or `None` when this
+    /// checkpoint stays on `rope_freq_base`.
+    pub(crate) fn llama3_inv_freq(&self) -> Option<Vec<f32>> {
+        match self.rope_scaling {
+            rdna_compute::rope::RopeScaling::Llama3(_) => {
+                let rope = rdna_compute::rope::Rope {
+                    theta: f64::from(self.rope_freq_base),
+                    scaling: self.rope_scaling,
+                };
+                let (freq, _scale) = rope.inv_freq(self.head_dim);
+                Some(freq.into_iter().map(|f| f as f32).collect())
+            }
+            rdna_compute::rope::RopeScaling::None | rdna_compute::rope::RopeScaling::Yarn(_) => {
+                None
+            }
+        }
+    }
+}
+
+/// Arch-0 RoPE. Llama 3 uses the per-pair table; every other scaling stays
+/// on `rope_freq_base`.
+pub fn apply_arch0_rope_f32(
+    gpu: &mut Gpu,
+    config: &LlamaConfig,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    pos_buf: &hip_bridge::DeviceBuffer,
+) -> HipResult<()> {
+    if let Some(freq) = config.llama3_inv_freq() {
+        gpu.rope_f32_inv_freq(
+            q,
+            k,
+            pos_buf,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            &freq,
+        )
+    } else {
+        gpu.rope_f32(
+            q,
+            k,
+            pos_buf,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            config.rope_freq_base,
+        )
+    }
+}
+
+/// Batched arch-0 RoPE. Same split as [`apply_arch0_rope_f32`].
+pub fn apply_arch0_rope_batched_f32(
+    gpu: &mut Gpu,
+    config: &LlamaConfig,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    positions: &GpuTensor,
+    batch_size: usize,
+) -> HipResult<()> {
+    if let Some(freq) = config.llama3_inv_freq() {
+        gpu.rope_batched_f32_inv_freq(
+            q,
+            k,
+            positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            &freq,
+            batch_size,
+        )
+    } else {
+        gpu.rope_batched_f32(
+            q,
+            k,
+            positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            config.rope_freq_base,
+            batch_size,
+        )
     }
 }
 
@@ -1924,16 +2013,7 @@ pub fn prefill_forward(
         }
 
         // Batched RoPE: all positions in one kernel launch
-        gpu.rope_batched_f32(
-            &q_batch,
-            &k_batch,
-            &pos_array,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            config.rope_freq_base,
-            batch,
-        )?;
+        apply_arch0_rope_batched_f32(gpu, config, &q_batch, &k_batch, &pos_array, batch)?;
 
         // Batched KV cache write: all positions in 2 kernel launches (K + V)
         if kv_cache.quantized && kv_cache.quant_q8 {
@@ -3070,16 +3150,7 @@ fn forward_prefill_chunk(
             Some(tm) => tm.rope_positions,
             None => &pbs.positions,
         };
-        gpu.rope_batched_f32(
-            &pbs.fa_q_batch,
-            &pbs.fa_k_batch,
-            rope_pos,
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            config.rope_freq_base,
-            n,
-        )?;
+        apply_arch0_rope_batched_f32(gpu, config, &pbs.fa_q_batch, &pbs.fa_k_batch, rope_pos, n)?;
 
         // Batched KV write.
         if kv_cache.quant_asym4 {
@@ -4493,6 +4564,7 @@ fn forward_scratch_compute_lowered(
         pos,
         extract_layers: capture.as_ref().map_or(&[], |c| c.extract_layers),
         cap_rows: std::cell::RefCell::new(Vec::new()),
+        rope_inv_freq: config.llama3_inv_freq(),
     };
     crate::arch_spec::dense_forward(gpu, &ctx, &arch)?;
     if let Some(cap) = capture {
@@ -4538,6 +4610,8 @@ struct LlamaDense<'a> {
     extract_layers: &'a [usize],
     /// Post-FFN residual rows downloaded by `after_layer` for `extract_layers`.
     cap_rows: std::cell::RefCell<Vec<Vec<f32>>>,
+    /// Llama 3 frequencies for this forward. `None` keeps theta RoPE.
+    rope_inv_freq: Option<Vec<f32>>,
 }
 
 impl crate::arch_spec::DenseArch for LlamaDense<'_> {
@@ -4546,6 +4620,9 @@ impl crate::arch_spec::DenseArch for LlamaDense<'_> {
     }
     fn knobs(&self) -> &crate::arch_spec::DenseKnobs {
         &self.knobs
+    }
+    fn rope_inv_freq(&self) -> Option<&[f32]> {
+        self.rope_inv_freq.as_deref()
     }
     fn scratch(&self) -> crate::arch_spec::DenseScratch<'_> {
         let s = self.scratch;
@@ -4743,15 +4820,7 @@ pub fn forward_scratch_layers(
             }
         }
 
-        gpu.rope_f32(
-            &scratch.q,
-            &scratch.k,
-            &scratch.pos_buf,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            config.rope_freq_base,
-        )?;
+        apply_arch0_rope_f32(gpu, config, &scratch.q, &scratch.k, &scratch.pos_buf)?;
 
         if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
             // Asym/Givens KV: the manual ladder below has no asym kernels, so
@@ -5095,15 +5164,7 @@ pub fn forward_early_exit(
             }
         }
 
-        gpu.rope_f32(
-            &scratch.q,
-            &scratch.k,
-            &scratch.pos_buf,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            config.rope_freq_base,
-        )?;
+        apply_arch0_rope_f32(gpu, config, &scratch.q, &scratch.k, &scratch.pos_buf)?;
 
         // KV write + attention (use same dispatch as forward_scratch_layers)
         if kv_cache.quantized && kv_cache.quant_q8 {
@@ -5339,15 +5400,7 @@ pub fn forward_scratch_compute_capture(
             }
         }
 
-        gpu.rope_f32(
-            &scratch.q,
-            &scratch.k,
-            &scratch.pos_buf,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            config.rope_freq_base,
-        )?;
+        apply_arch0_rope_f32(gpu, config, &scratch.q, &scratch.k, &scratch.pos_buf)?;
 
         if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
             // Asym/Givens KV: the manual ladder below has no asym kernels, so
@@ -5710,15 +5763,7 @@ pub fn forward(
         }
 
         // RoPE — GPU-side, reads pos from GPU buffer
-        gpu.rope_f32(
-            &q,
-            &k,
-            &pos_buf,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            config.rope_freq_base,
-        )?;
+        apply_arch0_rope_f32(gpu, config, &q, &k, &pos_buf)?;
 
         // Store K, V in GPU cache + attention
         gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
@@ -5901,15 +5946,7 @@ fn forward_logits_gpu(
             }
         }
 
-        gpu.rope_f32(
-            &q,
-            &k,
-            &pos_buf,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            config.rope_freq_base,
-        )?;
+        apply_arch0_rope_f32(gpu, config, &q, &k, &pos_buf)?;
 
         gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
         gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;

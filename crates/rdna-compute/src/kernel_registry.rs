@@ -1212,7 +1212,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMV_Q8_0_WIDE_SRC,
             ["gemv_q8_0_wide"]
         );
-        add!("rope", kernels::ROPE_SRC, ["rope_f32"]);
+        add!("rope", kernels::ROPE_SRC, ["rope_f32", "rope_inv_freq_f32"]);
         add!(
             "conv1d_gated_decode",
             kernels::CONV1D_GATED_DECODE_SRC,
@@ -1257,7 +1257,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "rope_batched",
             kernels::ROPE_BATCHED_SRC,
-            ["rope_batched_f32"]
+            ["rope_batched_f32", "rope_inv_freq_batched_f32"]
         );
     }
     if matches!(arch, "gfx1201" | "gfx1151") {
