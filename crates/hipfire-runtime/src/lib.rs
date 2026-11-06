@@ -141,6 +141,7 @@ pub mod stop_sequence;
 pub mod tokenizer;
 
 pub mod calibration;
+pub mod llama_tool_span;
 pub mod tool_call;
 pub mod weight_backend;
 

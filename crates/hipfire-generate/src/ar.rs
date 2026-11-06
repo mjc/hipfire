@@ -896,7 +896,8 @@ impl GenerationRoute {
     /// Proven semantic-safe producers for non-empty tools.
     /// Exactly: Qwen AR, Qwen4 AR, Qwen4 native MTP, Qwen DFlash/spec, DS4 AR,
     /// DS4 EP, DS4 spec, Glimmer AR, Glimmer spec, Maple AR, Gemma 4, Raon AR
-    /// (`generate_raon`: shared `QwenArSemanticProducer` XML tool router).
+    /// (`generate_raon`: shared `QwenArSemanticProducer` XML tool router),
+    /// Llama AR.
     ///
     /// `Qwen4Spec` runs the same `<tool_call>` router (`Qwen35Emit` via the
     /// Qwen4 carrier) over committed tokens that `Qwen4Ar` runs through
@@ -922,6 +923,15 @@ impl GenerationRoute {
     /// `finish_reason == "tool_calls"` terminal. A load whose template carries
     /// no tool format refuses tools by name instead. The developer-gated EAGLE
     /// branch never serves a tools request, so tools always decode AR.
+    ///
+    /// `LlamaAr` is admitted on the same legacy contract. The llama decode
+    /// path withholds a completed `[TOOL_CALLS][{name, arguments, id?}]` span
+    /// from the content stream and stages those calls on a
+    /// `finish_reason == "tool_calls"` terminal, emitting the `tool_calls`
+    /// event before commit. That is the span the arch-0 Mistral v3 chat
+    /// template writes. `LlamaSpec` is a separate route and stays refused. A
+    /// length cap does not release calls. An unclosed span at eos is a
+    /// validation error and produces no done.
     pub const fn supports_tools(self) -> bool {
         matches!(
             self,
@@ -937,6 +947,7 @@ impl GenerationRoute {
                 | Self::MapleAr
                 | Self::RaonAr
                 | Self::Gemma4Ar
+                | Self::LlamaAr
         )
     }
 
@@ -6304,6 +6315,7 @@ pub fn generate(
         let this_turn_prompt_len_llama = new_tokens.len();
         m.seq_pos += new_tokens.len();
         m.conversation_tokens.extend_from_slice(&new_tokens);
+        let llama_committed_len = m.conversation_tokens.len();
         let ngram_scope_start_llama = m.conversation_tokens.len() - this_turn_prompt_len_llama;
         // Test-only fault seam (G4.10): fires after prefill GPU/KV mutation,
         // before any token visibility. Same production fail-closed terminal
@@ -6332,6 +6344,10 @@ pub fn generate(
         // strip-think, byte-level stop_at); see crates/engine/src/eos_filter.rs.
         let mut stream_bytes: Vec<u8> = Vec::new();
         let mut filter = EosFilter::new(EosFilterConfig::default());
+        // Tools off: the splitter is disabled and the loop never calls it, so
+        // token bytes stay on the pre-existing writeln path.
+        let mut tool_span =
+            hipfire_runtime::llama_tool_span::LlamaToolSplitter::new(tools_nonempty);
 
         let mut hit_stop = false;
         for _ in 0..max_tokens {
@@ -6369,14 +6385,25 @@ pub fn generate(
             };
             if let FilterAction::Emit(text_bytes) = action {
                 let text = std::str::from_utf8(&text_bytes).unwrap();
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                    id,
-                    serde_json::to_string(&text).unwrap_or_default(),
-                    active_attempt_id()
-                );
-                let _ = stdout.flush();
+                if tools_nonempty {
+                    match tool_span.push(text) {
+                        Ok(visible) => {
+                            if !visible.is_empty() {
+                                write_llama_content_token(stdout, id, &visible);
+                            }
+                        }
+                        Err(error) => {
+                            // Drop decode tokens so conversation stays aligned
+                            // with seq_pos. KV rows already written stay; this
+                            // is a protocol error, not a GPU rollback.
+                            m.conversation_tokens.truncate(llama_committed_len);
+                            llama_tool_span_error(stdout, id, &error);
+                            return;
+                        }
+                    }
+                } else {
+                    write_llama_content_token(stdout, id, text);
+                }
             }
 
             // Scope repeat_buf to this turn's prompt + generated tokens
@@ -6452,6 +6479,40 @@ pub fn generate(
             next_token = tok;
             rng_state = rng;
         }
+        let tool_end = if hit_stop {
+            hipfire_runtime::llama_tool_span::LlamaToolEnd::Stop
+        } else {
+            hipfire_runtime::llama_tool_span::LlamaToolEnd::Length
+        };
+        if tools_nonempty {
+            // The default filter holds a trailing partial UTF-8 sequence.
+            // Drain it into the splitter only when tools are on, so a held
+            // tail is not dropped and the tools-off path stays byte-identical.
+            let tail = filter.finish();
+            let tail_text = std::str::from_utf8(&tail).unwrap();
+            let closed = tool_span.push(tail_text).and_then(|visible| {
+                if !visible.is_empty() {
+                    write_llama_content_token(stdout, id, &visible);
+                }
+                tool_span.finish(tool_end)
+            });
+            match closed {
+                Ok(visible) => {
+                    if !visible.is_empty() {
+                        write_llama_content_token(stdout, id, &visible);
+                    }
+                }
+                Err(error) => {
+                    m.conversation_tokens.truncate(llama_committed_len);
+                    llama_tool_span_error(stdout, id, &error);
+                    return;
+                }
+            }
+        }
+        let tool_terminal = hipfire_runtime::llama_tool_span::llama_tool_terminal(
+            tool_end,
+            tool_span.calls().len(),
+        );
         m.seq_pos += generated;
 
         // ChatML \n boundary — run through forward to keep KV cache in sync
@@ -6511,7 +6572,7 @@ pub fn generate(
             "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
             "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
             "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
-            "finish_reason": if hit_stop { "stop" } else { "length" },
+            "finish_reason": tool_terminal.finish_reason,
             "attempt_id": active_attempt_id(),
         });
         if !pflash_frag.is_empty() {
@@ -6523,6 +6584,18 @@ pub fn generate(
                     pending_done[k] = v;
                 }
             }
+        }
+        if tool_terminal.release_calls {
+            // Legacy clients read the event. `stage_terminal_tool_calls`
+            // also embeds `calls` on the done, and only when finish_reason
+            // is tool_calls. The event has to precede commit_ready.
+            stage_terminal_tool_calls(
+                &mut pending_done,
+                tool_terminal.finish_reason,
+                tool_span.calls(),
+            );
+            emit_tool_calls_event(stdout, id, tool_span.calls());
+            let _ = stdout.flush();
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
             ClientTerminalDecision::Commit => emit_active_route_done(stdout, id, &pending_done),
@@ -6536,6 +6609,33 @@ pub fn generate(
             }
         }
     }
+}
+
+fn write_llama_content_token(stdout: &mut impl std::io::Write, id: &str, text: &str) {
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
+        id,
+        serde_json::to_string(text).unwrap_or_default(),
+        active_attempt_id()
+    );
+    let _ = stdout.flush();
+}
+
+fn llama_tool_span_error(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    error: &hipfire_runtime::llama_tool_span::LlamaToolSpanError,
+) {
+    crate::dense::emit_active_attempt_error(
+        stdout,
+        Some(id),
+        &format!("llama tool call: {error}"),
+        "validation",
+        false,
+        false,
+    );
+    let _ = stdout.flush();
 }
 
 /// Resolve whether DeepSeek4 spec-decode is requested from the installed
