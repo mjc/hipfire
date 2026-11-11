@@ -306,8 +306,10 @@ impl HfqFile {
     ///
     /// On a gfx1100 host (2026-08-23) that shape reached about 4.5 GB/s after
     /// the cache was dropped; one `FADV_WILLNEED` stayed near 1.7 GB/s. The
-    /// warmer does not run when this file evicts the page cache, or when
-    /// `mincore` already shows at least 90% of it resident.
+    /// warmer does not run when this file evicts the page cache. It does not
+    /// consult `mincore`: a reader without write permission receives an
+    /// all-ones residency vector, so a cold file looks fully cached. A hit
+    /// in a cache that is already warm is just a cache hit.
     ///
     /// Call [`CacheWarmerGuard::finish`] before uploading from the mapping.
     /// A mapped copy faults those same pages, the fault window stays at its
@@ -318,9 +320,6 @@ impl HfqFile {
     pub fn start_cache_warmup(&self) -> CacheWarmerGuard {
         if self.evict_page_cache {
             return CacheWarmerGuard::empty("evict");
-        }
-        if self.mostly_page_cached() {
-            return CacheWarmerGuard::empty("resident");
         }
         let end = self
             .tensors
@@ -398,16 +397,21 @@ impl HfqFile {
             stop,
             progress,
             workers: handles.len(),
+            expected_bytes: end as u64,
+            started: Some(std::time::Instant::now()),
+            elapsed: std::time::Duration::ZERO,
             skipped: None,
             finished: false,
             handles: Some(handles),
         }
     }
 
-    /// Fraction of data pages already resident in the page cache, via
-    /// `mincore` over an untouched shared mapping (mapping does not fault
-    /// pages in, so this is free). Used to skip the warmer when a repeat
-    /// load would only re-copy an already-resident file.
+    /// Fraction of data pages `mincore` reports resident.
+    ///
+    /// The mapping is untouched, so the probe itself does not fault pages
+    /// in. A caller that can read the file but cannot write it receives an
+    /// all-ones vector, so this must not decide whether a cold read is
+    /// required. Weight warmup does not call it.
     #[cfg(unix)]
     pub fn mostly_page_cached(&self) -> bool {
         let end = self
@@ -500,11 +504,16 @@ pub struct CacheWarmupReport {
     pub workers: usize,
     /// Bytes successfully read into the page cache.
     pub bytes_read: u64,
-    /// Chunk reads or file opens that failed. An interrupted read is retried
-    /// and is not counted here.
+    /// Indexed range the workers were asked to cover, in bytes. Zero when
+    /// no workers ran.
+    pub expected_bytes: u64,
+    /// Time from start until the workers joined. Zero when no workers ran.
+    pub elapsed: std::time::Duration,
+    /// Chunk reads, file opens, or worker panics. An interrupted read is
+    /// retried and is not counted here.
     pub errors: u32,
-    /// Why no workers ran: `evict`, `resident`, `empty`, `spawn`, or
-    /// `unsupported`. `None` when workers ran.
+    /// Why no workers ran: `evict`, `empty`, `spawn`, or `unsupported`.
+    /// `None` when workers ran.
     pub skipped: Option<&'static str>,
 }
 
@@ -512,11 +521,21 @@ impl std::fmt::Display for CacheWarmupReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.skipped {
             Some(reason) => write!(f, "skipped ({reason})"),
-            None => write!(
+            None if self.expected_bytes > 0 && self.bytes_read != self.expected_bytes => write!(
                 f,
-                "{} workers, {:.3} GB, {} errors",
+                "{} workers, {:.3}/{:.3} GB in {:.2}s, {} errors",
                 self.workers,
                 self.bytes_read as f64 / 1e9,
+                self.expected_bytes as f64 / 1e9,
+                self.elapsed.as_secs_f64(),
+                self.errors
+            ),
+            None => write!(
+                f,
+                "{} workers, {:.3} GB in {:.2}s, {} errors",
+                self.workers,
+                self.bytes_read as f64 / 1e9,
+                self.elapsed.as_secs_f64(),
                 self.errors
             ),
         }
@@ -532,6 +551,9 @@ pub struct CacheWarmerGuard {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     progress: std::sync::Arc<WarmupProgress>,
     workers: usize,
+    expected_bytes: u64,
+    started: Option<std::time::Instant>,
+    elapsed: std::time::Duration,
     skipped: Option<&'static str>,
     finished: bool,
     #[cfg(unix)]
@@ -546,6 +568,9 @@ impl CacheWarmerGuard {
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             progress: std::sync::Arc::new(WarmupProgress::default()),
             workers: 0,
+            expected_bytes: 0,
+            started: None,
+            elapsed: std::time::Duration::ZERO,
             skipped: Some(skipped),
             finished: true,
             handles: None,
@@ -555,11 +580,15 @@ impl CacheWarmerGuard {
     /// Wait until every started worker has finished its range.
     ///
     /// A second call returns the same report. Unlike `Drop`, this does not
-    /// set the stop flag first.
+    /// set the stop flag first. The report's byte count is the coverage;
+    /// threads exiting is not enough on its own.
     pub fn finish(&mut self) -> CacheWarmupReport {
         if !self.finished {
             self.finished = true;
             self.join_handles();
+            if let Some(started) = self.started {
+                self.elapsed = started.elapsed();
+            }
         }
         self.snapshot()
     }
@@ -571,6 +600,8 @@ impl CacheWarmerGuard {
                 .progress
                 .bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
+            expected_bytes: self.expected_bytes,
+            elapsed: self.elapsed,
             errors: self
                 .progress
                 .errors
@@ -583,7 +614,11 @@ impl CacheWarmerGuard {
         #[cfg(unix)]
         if let Some(handles) = self.handles.take() {
             for handle in handles {
-                let _ = handle.join();
+                if handle.join().is_err() {
+                    self.progress
+                        .errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         #[cfg(not(unix))]
@@ -4666,6 +4701,35 @@ mod range_upload_release_tests {
         assert_eq!(report.bytes_read, 0);
         assert_eq!(report.errors, 0);
         assert_eq!(report.to_string(), "skipped (evict)");
+    }
+
+    /// A file that is already resident is still read. `mincore` is not a
+    /// reason to skip: without write permission it reports every page resident.
+    #[test]
+    fn resident_file_is_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights.hfq");
+        let data = vec![9u8; 256 * 1024];
+        let tensors = vec![HfqMemTensor {
+            name: "w".to_string(),
+            quant_type: 16,
+            shape: vec![256, 256],
+            group_size: 0,
+            data,
+        }];
+        write_hfqm_package_mem(&path, 16, "{}", &tensors).unwrap();
+        let mut hfq = HfqFile::open(&path).unwrap();
+        hfq.set_evict_page_cache(false);
+        let end = hfq
+            .tensors()
+            .last()
+            .map(|t| (t.data_offset + t.data_size) as u64);
+        let report = hfq.start_cache_warmup().finish();
+        assert_eq!(report.skipped, None, "{report}");
+        assert!(report.workers >= 1, "{report}");
+        assert_eq!(report.errors, 0, "{report}");
+        assert_eq!(Some(report.bytes_read), end, "{report}");
+        assert_eq!(report.expected_bytes, report.bytes_read, "{report}");
     }
 
     /// A cold file's `finish` returns only after the workers have read the
