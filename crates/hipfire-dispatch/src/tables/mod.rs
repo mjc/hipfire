@@ -102,6 +102,7 @@ impl ArchPredicate {
             // of has_wmma() (RDNA3/4 ⊂ wave32) → RDNA3/4 routing is unchanged.
             Self::HasWave32 => ctx.arch.is_wave32(),
             Self::HasWmma => ctx.arch.has_wmma(),
+            Self::HasWmmaOrGfx1010 => ctx.arch.has_wmma() || ctx.arch.is_gfx1010(),
             // gfx11-family wave32 WMMA only (RDNA3 + RDNA3.5), EXCLUDES gfx12/RDNA4 —
             // for WMMA kernels with no gfx12 source sibling (mb4, q8_0_wmma_x64).
             Self::HasWmmaW32 => ctx.arch.has_wmma_w32(),
