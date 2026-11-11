@@ -1,0 +1,343 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/var/lib/hipfire-models/qwen3.5-9b.mq3",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 4096,
+    "layers": 32,
+    "vocab": 248320,
+    "vl": false,
+    "pp": 1,
+    "audio": false,
+    "video": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": false,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "reasoning_effort_probe_error": null,
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false,
+    "kv_backend_request": "automatic",
+    "kv_backend": "legacy",
+    "kv_backend_reason": "gfx1010 has no tested VMM KV path for the selected --kv-mode",
+    "kv_backend_legacy": true,
+    "kv_backend_warning": "WARNING HIPFIRE_KV_BACKEND=legacy: automatic VMM selection unavailable (gfx1010 has no tested VMM KV path for the selected --kv-mode); using legacy KV storage. Inspect before benchmarking or filing a PR.",
+    "max_seq": 1024,
+    "max_seq_bound": "user",
+    "max_seq_reason": null,
+    "model_ctx": null,
+    "card_cap": null,
+    "kv_mode": "q8",
+    "mtp_mode_effective": "off",
+    "load_summary": {
+      "line": "hipfire load summary: qwen3.5-9b.mq3 (qwen3_5) | spec: off (DFlash off: speculation.dflash=off; MTP off: speculation.mtp=off; ngram off: speculation.ngram=off) | kv: K=q8 V=q8 (legacy backend, automatic) | context: 1024 (user-set; model/card limits unknown) | placement: fully resident | prefill: per-prompt chunking",
+      "spec": "off (DFlash off: speculation.dflash=off; MTP off: speculation.mtp=off; ngram off: speculation.ngram=off)",
+      "kv": "K=q8 V=q8 (legacy backend, automatic)",
+      "context": "1024 (user-set; model/card limits unknown)",
+      "placement": "fully resident",
+      "prefill": "per-prompt chunking"
+    }
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1010",
+    "hip_version": "7.2",
+    "vram_free_mb": 3412,
+    "vram_total_mb": 8176,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0,
+    "kv_backend": "legacy",
+    "kv_backend_request": "automatic",
+    "kv_backend_reason": "gfx1010 has no tested VMM KV path for the selected --kv-mode",
+    "kv_backend_legacy": true,
+    "kv_backend_warning": "WARNING HIPFIRE_KV_BACKEND=legacy: automatic VMM selection unavailable (gfx1010 has no tested VMM KV path for the selected --kv-mode); using legacy KV storage. Inspect before benchmarking or filing a PR.",
+    "kv_mode": "q8"
+  },
+  "vram_free_before_mb": 8136,
+  "max_seq": {
+    "effective": 1024,
+    "requested": 1024,
+    "source": "flag",
+    "run_need": null,
+    "model_limit": null
+  },
+  "max_tokens": 96,
+  "runs": 3,
+  "batch": 1,
+  "prompt_tokens": 511,
+  "prompt_md5": "7423e8940920082c6fa11576d23bc9a2",
+  "prompt_chars": 1867,
+  "warnings": [],
+  "power_device": {
+    "card": "card1",
+    "pci": "0000:03:00.0",
+    "arch": "gfx1010",
+    "selected_by": "hardware.devices=gfx1010",
+    "sample_period_ms": 500
+  },
+  "power": [
+    {
+      "samples": 30,
+      "duration_s": 14.37,
+      "gpu_metrics_format": "1.3",
+      "gfxclk_mhz": "unavailable",
+      "gfx_maxfreq_mhz_min": "unavailable",
+      "socket_power_w": "unavailable",
+      "gfx_power_w": "unavailable",
+      "gfx_temp_c_max": "unavailable",
+      "fclk_mhz_avg": "unavailable",
+      "throttle_pct": "unavailable",
+      "tctl_c_max": 63.8,
+      "perf_level": "auto",
+      "od_sclk": "unavailable",
+      "hwmon": {
+        "temp_c": {
+          "edge": {
+            "max": 60.0
+          },
+          "junction": {
+            "max": 85.0
+          },
+          "mem": {
+            "max": 66.0
+          }
+        },
+        "freq_mhz": {
+          "sclk": {
+            "avg": 2002.5,
+            "min": 2001.0,
+            "max": 2004.0
+          },
+          "mclk": {
+            "avg": 875.0,
+            "min": 875.0,
+            "max": 875.0
+          }
+        }
+      },
+      "memory": {
+        "vram_total_mib": 8176.0,
+        "vram_used_mib": 5038.1,
+        "vram_free_mib": 3137.9,
+        "gtt_total_mib": 15598.7,
+        "gtt_used_mib": 286.2,
+        "gtt_free_mib": 15312.5,
+        "mem_total_mib": 31197.4,
+        "mem_available_mib": 21615.2
+      }
+    },
+    {
+      "samples": 30,
+      "duration_s": 14.39,
+      "gpu_metrics_format": "1.3",
+      "gfxclk_mhz": "unavailable",
+      "gfx_maxfreq_mhz_min": "unavailable",
+      "socket_power_w": "unavailable",
+      "gfx_power_w": "unavailable",
+      "gfx_temp_c_max": "unavailable",
+      "fclk_mhz_avg": "unavailable",
+      "throttle_pct": "unavailable",
+      "tctl_c_max": 62.5,
+      "perf_level": "auto",
+      "od_sclk": "unavailable",
+      "hwmon": {
+        "temp_c": {
+          "edge": {
+            "max": 61.0
+          },
+          "junction": {
+            "max": 85.0
+          },
+          "mem": {
+            "max": 68.0
+          }
+        },
+        "freq_mhz": {
+          "sclk": {
+            "avg": 2002.3,
+            "min": 2001.0,
+            "max": 2003.0
+          },
+          "mclk": {
+            "avg": 875.0,
+            "min": 875.0,
+            "max": 875.0
+          }
+        }
+      },
+      "memory": {
+        "vram_total_mib": 8176.0,
+        "vram_used_mib": 5084.9,
+        "vram_free_mib": 3091.1,
+        "gtt_total_mib": 15598.7,
+        "gtt_used_mib": 292.2,
+        "gtt_free_mib": 15306.5,
+        "mem_total_mib": 31197.4,
+        "mem_available_mib": 21584.9
+      }
+    },
+    {
+      "samples": 30,
+      "duration_s": 14.39,
+      "gpu_metrics_format": "1.3",
+      "gfxclk_mhz": "unavailable",
+      "gfx_maxfreq_mhz_min": "unavailable",
+      "socket_power_w": "unavailable",
+      "gfx_power_w": "unavailable",
+      "gfx_temp_c_max": "unavailable",
+      "fclk_mhz_avg": "unavailable",
+      "throttle_pct": "unavailable",
+      "tctl_c_max": 63.6,
+      "perf_level": "auto",
+      "od_sclk": "unavailable",
+      "hwmon": {
+        "temp_c": {
+          "edge": {
+            "max": 61.0
+          },
+          "junction": {
+            "max": 86.0
+          },
+          "mem": {
+            "max": 68.0
+          }
+        },
+        "freq_mhz": {
+          "sclk": {
+            "avg": 2002.1,
+            "min": 2001.0,
+            "max": 2003.0
+          },
+          "mclk": {
+            "avg": 875.0,
+            "min": 875.0,
+            "max": 875.0
+          }
+        }
+      },
+      "memory": {
+        "vram_total_mib": 8176.0,
+        "vram_used_mib": 5017.6,
+        "vram_free_mib": 3158.4,
+        "gtt_total_mib": 15598.7,
+        "gtt_used_mib": 286.2,
+        "gtt_free_mib": 15312.5,
+        "mem_total_mib": 31197.4,
+        "mem_available_mib": 21629.3
+      }
+    }
+  ],
+  "spill": [
+    {
+      "baseline_gtt": 300130304,
+      "gtt": 306421760,
+      "vram_used": 5331914752,
+      "vram_total": 8573157376,
+      "spilled": false
+    },
+    {
+      "baseline_gtt": 300130304,
+      "gtt": 300130304,
+      "vram_used": 5261299712,
+      "vram_total": 8573157376,
+      "spilled": false
+    },
+    {
+      "baseline_gtt": 300130304,
+      "gtt": 302227456,
+      "vram_used": 5235306496,
+      "vram_total": 8573157376,
+      "spilled": false
+    }
+  ],
+  "decode_tok_s": {
+    "median": 40.6,
+    "mean": 40.63333333333333,
+    "min": 40.6,
+    "max": 40.7,
+    "stdev": 0.04714045207910384
+  },
+  "prefill_tok_s": {
+    "median": 42.5,
+    "mean": 42.53333333333333,
+    "min": 42.5,
+    "max": 42.6,
+    "stdev": 0.04714045207910384
+  },
+  "wall_tok_s": {
+    "median": 6.7,
+    "mean": 6.7,
+    "min": 6.7,
+    "max": 6.7,
+    "stdev": 0.0
+  },
+  "ttft_ms": {
+    "median": 12027.5,
+    "mean": 12021.833333333334,
+    "min": 12007.8,
+    "max": 12030.2,
+    "stdev": 9.984098468175937
+  },
+  "spec_requested": "off",
+  "load_speculation": {
+    "mtp_mode": "off",
+    "dflash_mode": "off",
+    "dspark_mode": "off",
+    "ngram_draft": false,
+    "mtp_effective": "off"
+  },
+  "spec_route": [
+    null,
+    null,
+    null
+  ],
+  "spec_tau": [
+    null,
+    null,
+    null
+  ],
+  "spec_mtp": [
+    null,
+    null,
+    null
+  ],
+  "samples": {
+    "decode": [
+      40.6,
+      40.6,
+      40.7
+    ],
+    "prefill": [
+      42.6,
+      42.5,
+      42.5
+    ],
+    "wall": [
+      6.7,
+      6.7,
+      6.7
+    ],
+    "ttft_ms": [
+      12007.8,
+      12030.2,
+      12027.5
+    ]
+  },
+  "kv_backend": "legacy",
+  "kv_backend_request": "automatic",
+  "kv_backend_reason": "gfx1010 has no tested VMM KV path for the selected --kv-mode",
+  "kv_backend_legacy": true,
+  "kv_backend_warning": "WARNING HIPFIRE_KV_BACKEND=legacy: automatic VMM selection unavailable (gfx1010 has no tested VMM KV path for the selected --kv-mode); using legacy KV storage. Inspect before benchmarking or filing a PR.",
+  "kv_mode": "q8",
+  "pp": 1,
+  "warmups_run": 2
+}

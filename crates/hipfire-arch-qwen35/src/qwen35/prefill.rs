@@ -4324,8 +4324,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // gfx10 RDNA1/2 scalar HFQ3 batched-prefill family (Phase 1).
     // Routes the four LA + FA matchers below to the new non-WMMA kernels
     // (gemm_qkv_hfq3g256, gemm_qkvza_hfq3g256, gemm_gate_up_hfq3g256,
-    // gemm_hfq3g256_residual). Lloyd-MQ3 stays gated on gfx11+ — no
-    // gfx10 Lloyd port (separate larger project).
+    // gemm_hfq3g256_residual). Lloyd MQ3 has a separate scalar gfx1010 path.
     let mq3_uniform_with_gfx10_scalar = matches!(dt, DType::MQ3G256)
         && matches!(
             arch,
@@ -4350,6 +4349,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
                 | "gfx1201"
         );
 
+    // gfx1010 uses F32 scalar projections; gfx11/12 use WMMA.
     // Lloyd-MQ3 (MQ3G256Lloyd): Phase 5 of issue #116 ships the
     // gemm_*_mq3g256_lloyd_wmma family alongside the existing HFQ3 WMMA
     // path; group stride differs (112 B Lloyd vs 104 B HFQ3) so dispatch
@@ -4359,7 +4359,14 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let lloyd_mq3_with_wmma = matches!(dt, DType::MQ3G256Lloyd)
         && matches!(
             arch,
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
+            "gfx1010"
+                | "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1200"
+                | "gfx1201"
         );
 
     // Lloyd-MQ4 (MQ4G256Lloyd): shipped as part of issue #182.
@@ -4454,6 +4461,14 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || bf16_with_gfx942
 }
 
+// On gfx1010 the new scalar route consumes every weight in a fused group as
+// Lloyd MQ3. Mixed groups must retain the per-token path.
+fn gfx1010_lloyd_group_batchable(arch: &str, dtypes: &[DType]) -> bool {
+    arch != "gfx1010"
+        || !dtypes.contains(&DType::MQ3G256Lloyd)
+        || dtypes.iter().all(|&dt| dt == DType::MQ3G256Lloyd)
+}
+
 /// Single source of truth for per-layer batchability and checked geometry.
 /// Called by `validate_ep_batch_compatibility`, `prefill_batch_pbs_eligible`,
 /// `fa_batched_ok` guard, and later EP state preflight. Validates every
@@ -4542,6 +4557,21 @@ pub fn qwen35_layer_batch_admissible(
             if l.w_down.m != dim || l.w_down.k != config.hidden_dim {
                 return Err(HipError::new(0, "DeltaNet w_down shape mismatch"));
             }
+            if !gfx1010_lloyd_group_batchable(
+                arch,
+                &[
+                    l.wqkv.gpu_dtype,
+                    l.wz.gpu_dtype,
+                    l.w_beta.gpu_dtype,
+                    l.w_alpha.gpu_dtype,
+                ],
+            ) || !gfx1010_lloyd_group_batchable(arch, &[l.w_gate.gpu_dtype, l.w_up.gpu_dtype])
+            {
+                return Err(HipError::new(
+                    0,
+                    "mixed Lloyd MQ3 projection group is not batchable on gfx1010",
+                ));
+            }
             for (name, dt) in [
                 ("wqkv", l.wqkv.gpu_dtype),
                 ("wz", l.wz.gpu_dtype),
@@ -4594,6 +4624,16 @@ pub fn qwen35_layer_batch_admissible(
             }
             if l.w_down.m != dim || l.w_down.k != config.hidden_dim {
                 return Err(HipError::new(0, "FullAttn w_down shape mismatch"));
+            }
+            if !gfx1010_lloyd_group_batchable(
+                arch,
+                &[l.wq.gpu_dtype, l.wk.gpu_dtype, l.wv.gpu_dtype],
+            ) || !gfx1010_lloyd_group_batchable(arch, &[l.w_gate.gpu_dtype, l.w_up.gpu_dtype])
+            {
+                return Err(HipError::new(
+                    0,
+                    "mixed Lloyd MQ3 projection group is not batchable on gfx1010",
+                ));
             }
             for (name, dt) in [
                 ("wq", l.wq.gpu_dtype),
@@ -8637,15 +8677,29 @@ mod tests {
     }
 
     #[test]
+    fn gfx1010_lloyd_groups_reject_mixed_weight_layouts() {
+        let lloyd = DType::MQ3G256Lloyd;
+        let mq4 = DType::MQ4G256;
+        assert!(gfx1010_lloyd_group_batchable("gfx1010", &[lloyd, lloyd]));
+        assert!(gfx1010_lloyd_group_batchable("gfx1010", &[mq4, mq4]));
+        assert!(!gfx1010_lloyd_group_batchable("gfx1010", &[lloyd, mq4]));
+        assert!(!gfx1010_lloyd_group_batchable("gfx1010", &[mq4, lloyd]));
+        assert!(gfx1010_lloyd_group_batchable("gfx1100", &[lloyd, mq4]));
+    }
+
+    #[test]
     fn qwen35_is_batchable_la_lloyd_mq3_mq4_on_gfx11_and_gfx12() {
         // MQ3-Lloyd admits gfx1100/1101/1102/1150/1151 — the MQ3-Lloyd GEMM
         // source selectors DO ship a gfx1150 kernel.
-        for &arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"] {
+        for &arch in &[
+            "gfx1010", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151",
+        ] {
             assert!(
                 is_batchable_la(DType::MQ3G256Lloyd, arch),
                 "MQ3G256Lloyd should batch on {arch}"
             );
         }
+        assert!(!is_batchable_la(DType::MQ3G256Lloyd, "gfx1030"));
         // MQ4-Lloyd admits gfx1100/1101/1102/1151 ONLY (NOT gfx1150). ANTIBLEED
         // admit-vs-select fix: the MQ4-Lloyd GEMM source selectors panic on
         // gfx1150 (no kernel), so admitting it upstream would crash at lookup.
