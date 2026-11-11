@@ -1845,6 +1845,327 @@ pub(crate) fn gguf_is_embed_tensor(name: &str) -> bool {
     name == "token_embd.weight"
 }
 
+fn llama3_rope_block(factor: f64, low: f64, high: f64, original: u64) -> serde_json::Value {
+    serde_json::json!({
+        "rope_type": "llama3",
+        "factor": factor,
+        "low_freq_factor": low,
+        "high_freq_factor": high,
+        "original_max_position_embeddings": original,
+    })
+}
+
+/// llama.cpp `conversion/llama.py` `generate_extra_tensors` stores Llama 3
+/// scaling as f32 divisors in `rope_freqs.weight` (or the layer-0 duplicate
+/// `blk.0.rope_freqs.weight`). Short wavelengths are 1, long wavelengths are
+/// `factor`, and the band between is `1 / ((1 - smooth) / factor + smooth)`.
+/// `ggml_rope` divides the pair angle by that divisor, so
+/// `inv_freq = base_inv_freq / divisor`.
+///
+/// The four HF keys are not in the file. Fit them from the tensor and keep
+/// the result only when regenerating the divisors matches the bytes.
+/// `low_freq_factor` is fixed at 1, which picks one equivalent
+/// `(original, low, high)` triple. A flat table of ones, or divisors that
+/// are not this blend, returns `None`. The caller skips the tensor when
+/// the file already names a different scaling type.
+fn llama3_from_rope_freqs(
+    gguf: &gguf_input::GgufFile,
+    theta: Option<f64>,
+    head_dim: Option<u64>,
+) -> Option<(f64, f64, f64, u64)> {
+    // A missing base uses the loader default. A present but unusable base
+    // cannot be replaced with that default: the fit would describe a
+    // different schedule.
+    let theta = match theta {
+        Some(theta) if theta.is_finite() && theta > 0.0 => theta,
+        Some(_) => return None,
+        None => 10_000.0,
+    };
+    let head_dim = usize::try_from(head_dim?).ok()?;
+    let info = gguf
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == "rope_freqs.weight")
+        .or_else(|| {
+            gguf.tensors
+                .iter()
+                .find(|tensor| tensor.name == "blk.0.rope_freqs.weight")
+        })?;
+    if info.dtype != gguf_input::GgmlType::F32 || head_dim < 2 || head_dim % 2 != 0 {
+        return None;
+    }
+    let n_pairs = head_dim / 2;
+    if info.numel() != n_pairs {
+        return None;
+    }
+    let bytes = gguf.tensor_data_checked(info)?;
+    if bytes.len() < n_pairs * 4 {
+        return None;
+    }
+    let factors: Vec<f64> = bytes
+        .chunks_exact(4)
+        .take(n_pairs)
+        .map(|chunk| f64::from(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
+        .collect();
+    if factors
+        .iter()
+        .any(|factor| !factor.is_finite() || *factor <= 0.0)
+    {
+        return None;
+    }
+    const ABS_EPS: f64 = 1e-4;
+    let close = |left: f64, right: f64| (left - right).abs() <= ABS_EPS * right.abs().max(1.0);
+    if factors.iter().all(|factor| (factor - 1.0).abs() <= ABS_EPS) {
+        return None;
+    }
+    let scale = *factors.last()?;
+    if !(scale.is_finite() && scale > 1.0 + ABS_EPS) {
+        return None;
+    }
+    let mut first_long = n_pairs;
+    for index in (0..n_pairs).rev() {
+        if close(factors[index], scale) {
+            first_long = index;
+        } else {
+            break;
+        }
+    }
+    if first_long == 0 {
+        return None;
+    }
+    let mut last_short = None;
+    for index in 0..first_long {
+        if close(factors[index], 1.0) {
+            last_short = Some(index);
+        } else {
+            break;
+        }
+    }
+    let last_short = last_short?;
+    let wavelen: Vec<f64> = (0..n_pairs)
+        .map(|pair| {
+            let inv_freq = 1.0 / theta.powf((2 * pair) as f64 / head_dim as f64);
+            2.0 * std::f64::consts::PI / inv_freq
+        })
+        .collect();
+    let (low_wavelen, high_wavelen) = if last_short + 1 == first_long {
+        // No blend sample. Both thresholds have to sit in the open gap,
+        // with the high wavelength below an integer original context.
+        // Placing them on one midpoint and then rounding can make
+        // high_freq_factor smaller than low_freq_factor, which the loader
+        // rejects.
+        no_middle_thresholds(wavelen[last_short], wavelen[first_long])?
+    } else if last_short + 2 == first_long {
+        // One middle pair makes the two-parameter fit singular. The low
+        // wavelength has to be an integer context length; rounding a real
+        // solution moves this divisor off the stored value.
+        one_middle_thresholds(
+            (scale / factors[last_short + 1] - 1.0) / (scale - 1.0),
+            wavelen[last_short + 1],
+            wavelen[last_short],
+            wavelen[first_long],
+        )?
+    } else {
+        let smooth_of = |divisor: f64| (scale / divisor - 1.0) / (scale - 1.0);
+        let mut sum_x = 0.0;
+        let mut sum_y = 0.0;
+        let mut sum_xx = 0.0;
+        let mut sum_xy = 0.0;
+        let mut count = 0.0;
+        for index in (last_short + 1)..first_long {
+            let x = 1.0 / wavelen[index];
+            let y = smooth_of(factors[index]);
+            if !y.is_finite() {
+                return None;
+            }
+            sum_x += x;
+            sum_y += y;
+            sum_xx += x * x;
+            sum_xy += x * y;
+            count += 1.0;
+        }
+        let det = count * sum_xx - sum_x * sum_x;
+        if !det.is_finite() || det.abs() < 1e-30 {
+            return None;
+        }
+        let slope = (count * sum_xy - sum_x * sum_y) / det;
+        let intercept = (sum_y * sum_xx - sum_x * sum_xy) / det;
+        let offset = -intercept;
+        if !(slope.is_finite() && offset.is_finite() && slope > 0.0 && offset > 0.0) {
+            return None;
+        }
+        let low_wavelen = slope / offset;
+        let high_wavelen = slope / (offset + 1.0);
+        if !(low_wavelen.is_finite()
+            && high_wavelen.is_finite()
+            && low_wavelen > high_wavelen
+            && high_wavelen > 0.0)
+        {
+            return None;
+        }
+        (low_wavelen, high_wavelen)
+    };
+    let original = low_wavelen.round();
+    if !(original.is_finite() && original >= 1.0 && original <= u64::MAX as f64) {
+        return None;
+    }
+    let original_u = original as u64;
+    let low_freq = 1.0;
+    let high_freq = original / high_wavelen;
+    // `llama3_scaling` rejects a high factor that is not strictly above the
+    // low factor. A block that fails that check must not be emitted.
+    if !(high_freq.is_finite() && high_freq > low_freq) {
+        return None;
+    }
+    let rebuilt = llama3_divisors(theta, head_dim, scale, low_freq, high_freq, original);
+    if rebuilt.len() != factors.len()
+        || rebuilt
+            .iter()
+            .zip(&factors)
+            .any(|(got, want)| !close(*got, *want))
+    {
+        return None;
+    }
+    Some((scale, low_freq, high_freq, original_u))
+}
+
+/// Thresholds for a table whose short and long plateaus meet with no blend pair.
+///
+/// `low_freq_factor` stays 1, so the low wavelength is the original context.
+/// That integer has to lie strictly inside the gap. The high wavelength lies
+/// strictly below it, so `high_freq_factor` stays above 1. Any such pair
+/// reproduces the table, because no sample falls between the thresholds.
+fn no_middle_thresholds(short_w: f64, long_w: f64) -> Option<(f64, f64)> {
+    if !(short_w.is_finite() && long_w.is_finite() && long_w > short_w && short_w >= 0.0) {
+        return None;
+    }
+    let floor_u64 = |value: f64| -> Option<u64> {
+        if !value.is_finite() || value < 0.0 || value >= (1u64 << 53) as f64 {
+            return None;
+        }
+        Some(value.floor() as u64)
+    };
+    let min_original = floor_u64(short_w)?.checked_add(1)?;
+    let mut max_original = floor_u64(long_w)?;
+    if long_w == long_w.floor() {
+        max_original = max_original.checked_sub(1)?;
+    }
+    if max_original < min_original {
+        return None;
+    }
+    let original = min_original + (max_original - min_original) / 2;
+    let original_f = original as f64;
+    let high_wavelen = 0.5 * (short_w + original_f);
+    if !(high_wavelen.is_finite() && high_wavelen > short_w && high_wavelen < original_f) {
+        return None;
+    }
+    Some((original_f, high_wavelen))
+}
+
+/// Both thresholds for a table with a single blend sample.
+///
+/// `low_freq_factor` stays 1, so the low wavelength is the original context.
+/// Any integer strictly above this sample and at or below the first long
+/// wavelength can reproduce the sample. Solve the high wavelength from that
+/// integer. A shallow blend also has to keep the high wavelength above the
+/// last short pair, which caps how large the original can be.
+fn one_middle_thresholds(
+    smooth: f64,
+    wavelen: f64,
+    short_w: f64,
+    long_w: f64,
+) -> Option<(f64, f64)> {
+    if !(smooth.is_finite()
+        && smooth > 0.0
+        && smooth < 1.0
+        && wavelen.is_finite()
+        && short_w.is_finite()
+        && long_w.is_finite()
+        && wavelen > short_w
+        && long_w > wavelen)
+    {
+        return None;
+    }
+    // Original context is rounded to an integer later. Stay inside the range
+    // f64 represents exactly so that rounding does not move it again.
+    let floor_u64 = |value: f64| -> Option<u64> {
+        if !value.is_finite() || value < 0.0 || value >= (1u64 << 53) as f64 {
+            return None;
+        }
+        Some(value.floor() as u64)
+    };
+    let min_original = floor_u64(wavelen)?.checked_add(1)?;
+    let mut max_original = floor_u64(long_w)?;
+    let ratio = short_w / wavelen;
+    if smooth < ratio {
+        let bound = short_w * (smooth - 1.0) / (smooth - ratio);
+        if !bound.is_finite() || bound <= 0.0 {
+            return None;
+        }
+        let mut below = floor_u64(bound)?;
+        if bound == bound.floor() {
+            below = below.checked_sub(1)?;
+        }
+        max_original = max_original.min(below);
+    }
+    if max_original < min_original {
+        return None;
+    }
+    let original = min_original + (max_original - min_original) / 2;
+    let original_f = original as f64;
+    let denom = smooth + original_f / wavelen - 1.0;
+    if !denom.is_finite() || denom <= 0.0 {
+        return None;
+    }
+    let high_wavelen = smooth * original_f / denom;
+    if !(high_wavelen.is_finite() && high_wavelen > short_w && high_wavelen < wavelen) {
+        return None;
+    }
+    Some((original_f, high_wavelen))
+}
+
+fn llama3_divisors(
+    theta: f64,
+    rotary_dim: usize,
+    factor: f64,
+    low: f64,
+    high: f64,
+    original: f64,
+) -> Vec<f64> {
+    let low_wavelen = original / low;
+    let high_wavelen = original / high;
+    (0..rotary_dim / 2)
+        .map(|pair| {
+            let inv_freq = 1.0 / theta.powf((2 * pair) as f64 / rotary_dim as f64);
+            let wavelen = 2.0 * std::f64::consts::PI / inv_freq;
+            if wavelen < high_wavelen {
+                1.0
+            } else if wavelen > low_wavelen {
+                factor
+            } else {
+                let smooth = (original / wavelen - low) / (high - low);
+                1.0 / ((1.0 - smooth) / factor + smooth)
+            }
+        })
+        .collect()
+}
+
+/// Unsigned metadata, rejecting a negative integer. A signed GGUF value of
+/// `-1` must not become `u64::MAX` and then look like a real context length.
+fn nonneg_meta_u(value: &gguf_input::MetaValue) -> Option<u64> {
+    match value {
+        gguf_input::MetaValue::U8(x) => Some(*x as u64),
+        gguf_input::MetaValue::U16(x) => Some(*x as u64),
+        gguf_input::MetaValue::U32(x) => Some(*x as u64),
+        gguf_input::MetaValue::U64(x) => Some(*x),
+        gguf_input::MetaValue::I8(x) if *x >= 0 => Some(*x as u64),
+        gguf_input::MetaValue::I16(x) if *x >= 0 => Some(*x as u64),
+        gguf_input::MetaValue::I32(x) if *x >= 0 => Some(*x as u64),
+        gguf_input::MetaValue::I64(x) if *x >= 0 => Some(*x as u64),
+        _ => None,
+    }
+}
+
 /// Build the `config` JSON object that `hipfire_runtime::hfq::config_from_hfq`
 /// reads. Mirrors the field names HuggingFace uses in `config.json` for
 /// LlamaForCausalLM / Qwen3ForCausalLM, populated from the GGUF
@@ -1947,6 +2268,36 @@ pub(crate) fn config_json_from_gguf(
     }
     if arch_id == 13 {
         apply_gemma4_fields(gguf, prefix, &mut cfg);
+    }
+    // Explicit llama3 keys win. Otherwise recover the same block from
+    // `rope_freqs.weight`, which is where llama.cpp stores the blend.
+    // A declared type other than llama3, a missing tensor, a table of ones,
+    // or divisors that are not this blend stay on theta.
+    if arch_str == "llama" {
+        let type_key = format!("{prefix}.rope.scaling.type");
+        let declared = gguf.metadata.get(&type_key).and_then(|v| v.as_str());
+        let type_ok = declared.is_none() || declared == Some("llama3");
+        if type_ok {
+            let factor = read_f(&format!("{prefix}.rope.scaling.factor"));
+            let low = read_f(&format!("{prefix}.rope.scaling.low_freq_factor"));
+            let high = read_f(&format!("{prefix}.rope.scaling.high_freq_factor"));
+            let original = gguf
+                .metadata
+                .get(&format!("{prefix}.rope.scaling.original_context_length"))
+                .and_then(nonneg_meta_u);
+            let block = if let (Some(factor), Some(low), Some(high), Some(original)) =
+                (factor, low, high, original)
+            {
+                Some(llama3_rope_block(factor, low, high, original))
+            } else {
+                llama3_from_rope_freqs(gguf, rope_theta, head_dim).map(
+                    |(factor, low, high, original)| llama3_rope_block(factor, low, high, original),
+                )
+            };
+            if let Some(block) = block {
+                cfg.insert("rope_scaling".to_string(), block);
+            }
+        }
     }
     cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
     cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
@@ -2198,7 +2549,7 @@ pub(crate) fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
 #[cfg(test)]
 mod gemma4_config_tests {
     use crate::calibration::config_json_from_gguf;
-    use crate::gguf_input::{GgufFile, MetaValue, TensorInfo};
+    use crate::gguf_input::{GgmlType, GgufFile, MetaValue, TensorInfo};
     use std::collections::HashMap;
 
     /// Metadata + tensor table mirroring the real gemma-4-12b GGUF layout
@@ -2383,9 +2734,336 @@ mod gemma4_config_tests {
         let cfg = config_json_from_gguf(&gguf, "llama", 0);
         assert!(cfg.get("layer_types").is_none());
         assert!(cfg.get("rope_parameters").is_none());
+        assert!(cfg.get("rope_scaling").is_none());
         assert!(cfg.get("attention_k_eq_v").is_none());
         assert_eq!(cfg["num_key_value_heads"].as_u64(), Some(8));
         assert_eq!(cfg["head_dim"].as_u64(), Some(128));
+    }
+
+    fn llama31_scaling_meta(include_freq_factors: bool) -> HashMap<String, MetaValue> {
+        let mut m = HashMap::new();
+        m.insert("llama.embedding_length".into(), MetaValue::U32(4096));
+        m.insert("llama.block_count".into(), MetaValue::U32(32));
+        m.insert("llama.attention.head_count".into(), MetaValue::U32(32));
+        m.insert("llama.attention.head_count_kv".into(), MetaValue::U32(8));
+        m.insert("llama.feed_forward_length".into(), MetaValue::U32(14336));
+        m.insert("llama.vocab_size".into(), MetaValue::U32(128256));
+        m.insert("llama.context_length".into(), MetaValue::U32(131072));
+        m.insert("llama.rope.freq_base".into(), MetaValue::F32(500000.0));
+        m.insert(
+            "llama.rope.scaling.type".into(),
+            MetaValue::String("llama3".into()),
+        );
+        m.insert("llama.rope.scaling.factor".into(), MetaValue::F32(8.0));
+        m.insert(
+            "llama.rope.scaling.original_context_length".into(),
+            MetaValue::U32(8192),
+        );
+        if include_freq_factors {
+            m.insert(
+                "llama.rope.scaling.low_freq_factor".into(),
+                MetaValue::F32(1.0),
+            );
+            m.insert(
+                "llama.rope.scaling.high_freq_factor".into(),
+                MetaValue::F32(4.0),
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn llama_gguf_llama3_keys_write_hf_rope_scaling() {
+        let gguf = GgufFile::for_tests(llama31_scaling_meta(true), vec![]).unwrap();
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
+        let rope = &cfg["rope_scaling"];
+        assert_eq!(rope["rope_type"].as_str(), Some("llama3"));
+        assert_eq!(rope["factor"].as_f64(), Some(8.0));
+        assert_eq!(rope["low_freq_factor"].as_f64(), Some(1.0));
+        assert_eq!(rope["high_freq_factor"].as_f64(), Some(4.0));
+        assert_eq!(
+            rope["original_max_position_embeddings"].as_u64(),
+            Some(8192)
+        );
+        assert_eq!(cfg["rope_theta"].as_f64(), Some(500000.0));
+        assert_eq!(cfg["max_position_embeddings"].as_u64(), Some(131072));
+        let schedule = rdna_compute::rope::RopeLlama3::new(8.0, 1.0, 4.0, 8192);
+        assert_ne!(schedule, rdna_compute::rope::RopeLlama3::OFF);
+    }
+
+    #[test]
+    fn llama_gguf_missing_freq_factors_omits_rope_scaling() {
+        let gguf = GgufFile::for_tests(llama31_scaling_meta(false), vec![]).unwrap();
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
+        assert!(cfg.get("rope_scaling").is_none());
+        assert_eq!(cfg["rope_theta"].as_f64(), Some(500000.0));
+    }
+
+    /// Divisors llama.cpp stores in `rope_freqs.weight` for the published
+    /// Llama 3.1 blend (factor 8, low 1, high 4, original 8192, theta 500000,
+    /// head dim 128). Short pairs are 1, long pairs are 8, and the middle is
+    /// `1 / ((1 - smooth) / factor + smooth)`.
+    fn llama31_rope_freq_divisors() -> Vec<f32> {
+        const THETA: f64 = 500_000.0;
+        const DIM: usize = 128;
+        const FACTOR: f64 = 8.0;
+        const LOW: f64 = 1.0;
+        const HIGH: f64 = 4.0;
+        const ORIGINAL: f64 = 8192.0;
+        let low_wavelen = ORIGINAL / LOW;
+        let high_wavelen = ORIGINAL / HIGH;
+        (0..DIM / 2)
+            .map(|pair| {
+                let inv_freq = 1.0 / THETA.powf((2 * pair) as f64 / DIM as f64);
+                let wavelen = 2.0 * std::f64::consts::PI / inv_freq;
+                let divisor = if wavelen < high_wavelen {
+                    1.0
+                } else if wavelen > low_wavelen {
+                    FACTOR
+                } else {
+                    let smooth = (ORIGINAL / wavelen - LOW) / (HIGH - LOW);
+                    1.0 / ((1.0 - smooth) / FACTOR + smooth)
+                };
+                divisor as f32
+            })
+            .collect()
+    }
+
+    /// Stock llama.cpp metadata: freq base and context, no scaling keys.
+    fn llama31_stock_meta() -> HashMap<String, MetaValue> {
+        let mut meta = llama31_scaling_meta(false);
+        meta.remove("llama.rope.scaling.type");
+        meta.remove("llama.rope.scaling.factor");
+        meta.remove("llama.rope.scaling.original_context_length");
+        meta
+    }
+
+    fn gguf_with_divisors(
+        meta: HashMap<String, MetaValue>,
+        tensor_name: &str,
+        divisors: &[f32],
+    ) -> GgufFile {
+        let mut bytes = Vec::with_capacity(divisors.len() * 4);
+        for divisor in divisors {
+            bytes.extend_from_slice(&divisor.to_le_bytes());
+        }
+        GgufFile::for_tests_with_data(
+            meta,
+            vec![TensorInfo {
+                name: tensor_name.into(),
+                shape: vec![divisors.len()],
+                dtype: GgmlType::F32,
+                offset: 0,
+            }],
+            &bytes,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn llama_gguf_rope_freqs_write_hf_rope_scaling() {
+        for name in ["rope_freqs.weight", "blk.0.rope_freqs.weight"] {
+            let gguf =
+                gguf_with_divisors(llama31_stock_meta(), name, &llama31_rope_freq_divisors());
+            let cfg = config_json_from_gguf(&gguf, "llama", 0);
+            let rope = &cfg["rope_scaling"];
+            assert_eq!(rope["rope_type"].as_str(), Some("llama3"), "{name}");
+            let factor = rope["factor"].as_f64().expect(name);
+            let low = rope["low_freq_factor"].as_f64().expect(name);
+            let high = rope["high_freq_factor"].as_f64().expect(name);
+            let original = rope["original_max_position_embeddings"]
+                .as_u64()
+                .expect(name);
+            assert!((factor - 8.0).abs() < 1e-6, "{name}: factor {factor}");
+            assert!((low - 1.0).abs() < 1e-6, "{name}");
+            assert!((high - 4.0).abs() < 1e-4, "{name}: high {high}");
+            assert_eq!(original, 8192, "{name}");
+            assert_eq!(cfg["max_position_embeddings"].as_u64(), Some(131072));
+            let schedule =
+                rdna_compute::rope::RopeLlama3::new(factor, low, high, original as usize);
+            let plain = |pair: usize| 500_000.0_f64.powf(-((2 * pair) as f64) / 128.0);
+            let scaled = |pair: usize| f64::from(schedule.scale(plain(pair) as f32));
+            assert!((scaled(0) - 1.0).abs() < 1e-5, "{name}");
+            assert!(
+                (scaled(29) - 0.0021665707635033591).abs() < 1e-5,
+                "{name}: {}",
+                scaled(29)
+            );
+            assert!((scaled(32) - 0.00052484616099295468).abs() < 1e-6, "{name}");
+            assert!((scaled(63) - 3.0689259889145111e-7).abs() < 1e-9, "{name}");
+            let past = 9000.0_f64;
+            assert!(((past * scaled(0)).sin() - (past * plain(0)).sin()).abs() < 1e-5);
+            assert!(((past * scaled(63)).sin() - (past * plain(63)).sin()).abs() > 1e-6);
+        }
+    }
+
+    #[test]
+    fn llama_gguf_unit_rope_freqs_stay_on_theta() {
+        let gguf = gguf_with_divisors(llama31_stock_meta(), "rope_freqs.weight", &[1.0; 64]);
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
+        assert!(cfg.get("rope_scaling").is_none());
+        assert_eq!(cfg["rope_theta"].as_f64(), Some(500000.0));
+    }
+
+    #[test]
+    fn llama_gguf_yarn_type_ignores_rope_freqs() {
+        let mut meta = llama31_stock_meta();
+        meta.insert(
+            "llama.rope.scaling.type".into(),
+            MetaValue::String("yarn".into()),
+        );
+        let gguf = gguf_with_divisors(meta, "rope_freqs.weight", &llama31_rope_freq_divisors());
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
+        assert!(cfg.get("rope_scaling").is_none());
+    }
+
+    #[test]
+    fn llama_gguf_non_llama3_divisors_omit_rope_scaling() {
+        let weird: Vec<f32> = (0..64).map(|i| 1.0 + (i as f32) * 0.05).collect();
+        let gguf = gguf_with_divisors(llama31_stock_meta(), "rope_freqs.weight", &weird);
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
+        assert!(cfg.get("rope_scaling").is_none());
+    }
+
+    #[test]
+    fn llama_gguf_negative_original_context_does_not_emit_a_block() {
+        let mut meta = llama31_scaling_meta(true);
+        meta.insert(
+            "llama.rope.scaling.original_context_length".into(),
+            MetaValue::I64(-1),
+        );
+        let gguf = GgufFile::for_tests(meta, vec![]).unwrap();
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
+        assert!(cfg.get("rope_scaling").is_none());
+    }
+
+    #[test]
+    fn llama_gguf_truncated_rope_freqs_omit_rope_scaling() {
+        let mut meta = llama31_stock_meta();
+        meta.insert("llama.attention.key_length".into(), MetaValue::U32(128));
+        let gguf = GgufFile::for_tests_with_data(
+            meta,
+            vec![TensorInfo {
+                name: "rope_freqs.weight".into(),
+                shape: vec![64],
+                dtype: GgmlType::F32,
+                offset: 0,
+            }],
+            &[0u8; 8],
+        )
+        .unwrap();
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
+        assert!(cfg.get("rope_scaling").is_none());
+    }
+
+    /// Head dim 128, theta 500000, factor 8, low 1, high 1.1, original 4096.
+    /// No pair falls in the blend band, so the table is 32 ones then 32 eights.
+    /// The recovered factors regenerate those divisors.
+    #[test]
+    fn llama_gguf_no_middle_pair_recovers_llama3() {
+        const THETA: f64 = 500_000.0;
+        const DIM: usize = 128;
+        const FACTOR: f64 = 8.0;
+        const LOW: f64 = 1.0;
+        const HIGH: f64 = 1.1;
+        const ORIGINAL: f64 = 4096.0;
+        let low_wavelen = ORIGINAL / LOW;
+        let high_wavelen = ORIGINAL / HIGH;
+        let divisors: Vec<f32> = (0..DIM / 2)
+            .map(|pair| {
+                let inv_freq = 1.0 / THETA.powf((2 * pair) as f64 / DIM as f64);
+                let wavelen = 2.0 * std::f64::consts::PI / inv_freq;
+                let divisor = if wavelen < high_wavelen {
+                    1.0
+                } else if wavelen > low_wavelen {
+                    FACTOR
+                } else {
+                    let smooth = (ORIGINAL / wavelen - LOW) / (HIGH - LOW);
+                    1.0 / ((1.0 - smooth) / FACTOR + smooth)
+                };
+                divisor as f32
+            })
+            .collect();
+        assert!(divisors.iter().take(32).all(|d| *d == 1.0));
+        assert!(divisors.iter().skip(32).all(|d| *d == 8.0));
+        let gguf = gguf_with_divisors(llama31_stock_meta(), "rope_freqs.weight", &divisors);
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
+        let rope = &cfg["rope_scaling"];
+        assert_eq!(rope["rope_type"].as_str(), Some("llama3"));
+        let factor = rope["factor"].as_f64().expect("factor");
+        let low = rope["low_freq_factor"].as_f64().expect("low");
+        let high = rope["high_freq_factor"].as_f64().expect("high");
+        let original = rope["original_max_position_embeddings"]
+            .as_u64()
+            .expect("original");
+        assert!(high > low);
+        assert!((factor - FACTOR).abs() < 1e-4, "factor {factor}");
+        let schedule = rdna_compute::rope::RopeLlama3::new(factor, low, high, original as usize);
+        let base = |pair: usize| 1.0 / THETA.powf((2 * pair) as f64 / DIM as f64);
+        for (pair, divisor) in divisors.iter().enumerate() {
+            let want = base(pair) / f64::from(*divisor);
+            let got = f64::from(schedule.scale(base(pair) as f32));
+            assert!(
+                (got - want).abs() <= 1e-4 * want.abs().max(1.0),
+                "pair {pair}: got {got} want {want}"
+            );
+        }
+    }
+
+    /// Head dim 8, theta 500000, one middle pair between the short and long
+    /// plateaus. The two-parameter regression is singular for that table.
+    #[test]
+    fn llama_gguf_one_middle_pair_recovers_llama3() {
+        const THETA: f64 = 500_000.0;
+        const DIM: usize = 8;
+        const FACTOR: f64 = 8.0;
+        const LOW: f64 = 1.0;
+        const HIGH_WAVELEN: f64 = 50.0;
+        const LOW_WAVELEN: f64 = 1000.0;
+        let high = LOW_WAVELEN / HIGH_WAVELEN;
+        let divisors: Vec<f32> = (0..DIM / 2)
+            .map(|pair| {
+                let inv_freq = 1.0 / THETA.powf((2 * pair) as f64 / DIM as f64);
+                let wavelen = 2.0 * std::f64::consts::PI / inv_freq;
+                let divisor = if wavelen < HIGH_WAVELEN {
+                    1.0
+                } else if wavelen > LOW_WAVELEN {
+                    FACTOR
+                } else {
+                    let smooth = (LOW_WAVELEN / wavelen - LOW) / (high - LOW);
+                    1.0 / ((1.0 - smooth) / FACTOR + smooth)
+                };
+                divisor as f32
+            })
+            .collect();
+        let mut meta = llama31_stock_meta();
+        meta.insert(
+            "llama.attention.key_length".into(),
+            MetaValue::U32(DIM as u32),
+        );
+        let gguf = gguf_with_divisors(meta, "rope_freqs.weight", &divisors);
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
+        let rope = &cfg["rope_scaling"];
+        assert_eq!(rope["rope_type"].as_str(), Some("llama3"));
+        let factor = rope["factor"].as_f64().expect("factor");
+        assert!((factor - FACTOR).abs() < 1e-4, "factor {factor}");
+        let schedule = rdna_compute::rope::RopeLlama3::new(
+            factor,
+            rope["low_freq_factor"].as_f64().expect("low"),
+            rope["high_freq_factor"].as_f64().expect("high"),
+            rope["original_max_position_embeddings"]
+                .as_u64()
+                .expect("original") as usize,
+        );
+        for (pair, divisor) in divisors.iter().enumerate() {
+            let base = 1.0 / THETA.powf((2 * pair) as f64 / DIM as f64);
+            let got = f64::from(schedule.scale(base as f32));
+            let want = base / f64::from(*divisor);
+            assert!(
+                (got - want).abs() <= 1e-4 * want.abs().max(1.0),
+                "pair {pair}: got {got} want {want}"
+            );
+        }
     }
 
     /// gemma4_text is a distinct GGUF architecture string that still maps to
