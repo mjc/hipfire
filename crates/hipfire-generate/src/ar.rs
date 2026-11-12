@@ -7112,9 +7112,25 @@ pub fn generate(
                 );
                 if action.store {
                     let nl_set: std::collections::HashSet<u32> = nl.iter().copied().collect();
-                    let cached_seq =
-                        crate::qwen::qwen_dflash_cache_seq(&streamed_tokens, im_end_token, &nl_set);
-                    crate::qwen::store_legacy_asst_turn(m, &action, cached_seq);
+                    // The replayed body contains the call id, and the template
+                    // appends eos again, so the key includes the id and the
+                    // stored tokens omit the stopping eos.
+                    let include_call_ids = m
+                        .chat_template
+                        .as_deref()
+                        .is_some_and(|template| template.contains("[TOOL_CALLS]"));
+                    let cached_seq = crate::qwen::llama_tool_cache_seq(
+                        &streamed_tokens,
+                        im_end_token,
+                        &[config.eos_token, tokenizer.eos_id],
+                        &nl_set,
+                    );
+                    crate::qwen::store_legacy_asst_turn_for(
+                        m,
+                        &action,
+                        cached_seq,
+                        include_call_ids,
+                    );
                 }
                 emit_active_route_done(stdout, id, &pending_done)
             }

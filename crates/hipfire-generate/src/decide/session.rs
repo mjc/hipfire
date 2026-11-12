@@ -87,8 +87,14 @@ pub(crate) fn render_session_prompt(
     } else {
         primer
     };
+    let include_call_ids = template.contains("[TOOL_CALLS]");
     build_cached_history_jinja(&frame, &msgs, tools, |msg| {
-        crate::qwen::qwen_jinja_lookup_turn(&mut *asst_turn_cache, msg, &primer)
+        crate::qwen::qwen_jinja_lookup_turn_for(
+            &mut *asst_turn_cache,
+            msg,
+            &primer,
+            include_call_ids,
+        )
     })
     .map_err(render_err)
 }

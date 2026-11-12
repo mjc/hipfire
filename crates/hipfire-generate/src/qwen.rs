@@ -2911,8 +2911,18 @@ pub fn qwen_jinja_lookup_turn(
     msg: &hipfire_runtime::prompt_frame::Message,
     primer: &[u32],
 ) -> Option<hipfire_runtime::prompt_frame::CachedAssistantTurn> {
+    qwen_jinja_lookup_turn_for(cache, msg, primer, false)
+}
+
+/// [`qwen_jinja_lookup_turn`] using [`asst_turn_fingerprint_for`].
+pub fn qwen_jinja_lookup_turn_for(
+    cache: &mut AsstTurnCache,
+    msg: &hipfire_runtime::prompt_frame::Message,
+    primer: &[u32],
+    include_call_ids: bool,
+) -> Option<hipfire_runtime::prompt_frame::CachedAssistantTurn> {
     let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
-    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+    let fp = asst_turn_fingerprint_for(&normalized, &msg.tool_calls, include_call_ids);
     cache
         .get_for_reasoning(&fp, msg.reasoning_content.as_deref())
         .and_then(|turn| {
@@ -3097,11 +3107,10 @@ fn qwen_accept_tool_argument_replay(
 }
 
 /// Whether a whole-body tool-turn hit may replay its stored prose. The cache
-/// key of a tool-call turn covers only the calls (name + canonical arguments),
-/// because clients often echo such turns with empty content; a client that
-/// echoes non-empty content must echo the producer's own visible prose (the
-/// stored body with its reasoning stripped, up to the first `<tool_call>`),
-/// else the turn misses rather than replaying prose the client replaced.
+/// key of a tool-call turn covers the calls, because clients often echo such
+/// turns with empty content. A client that echoes non-empty content must echo
+/// the producer's own visible prose: the stored body with its reasoning
+/// stripped, up to the first `<tool_call>` or `[TOOL_CALLS]`.
 fn qwen_whole_body_prose_matches(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     turn: &hipfire_runtime::prompt_frame::CachedAssistantTurn,
@@ -3115,8 +3124,42 @@ fn qwen_whole_body_prose_matches(
         return false;
     };
     let produced = normalize_asst_turn_for_fingerprint(&tokenizer.decode(&body.token_ids));
-    let prose = produced.split("<tool_call>").next().unwrap_or("");
+    let prose = visible_prose_before_tool_call(&produced);
     prose.trim() == echoed.trim()
+}
+
+fn visible_prose_before_tool_call(produced: &str) -> &str {
+    let at = ["<tool_call>", "[TOOL_CALLS]"]
+        .into_iter()
+        .filter_map(|marker| produced.find(marker))
+        .min();
+    match at {
+        Some(at) => &produced[..at],
+        None => produced,
+    }
+}
+
+/// A `[TOOL_CALLS]` body contains each call id. A hit whose decoded tokens
+/// lack one of the client's ids belongs to a different turn. Qwen XML does
+/// not carry the id, so those templates skip the check.
+fn qwen_whole_body_call_ids_match(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    template: &str,
+    turn: &hipfire_runtime::prompt_frame::CachedAssistantTurn,
+    calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) -> bool {
+    if !template.contains("[TOOL_CALLS]") {
+        return true;
+    }
+    let Some(body) = turn.content.as_ref() else {
+        return false;
+    };
+    let produced = tokenizer.decode(&body.token_ids);
+    calls
+        .iter()
+        .filter_map(|call| call.id.as_deref())
+        .filter(|id| !id.is_empty())
+        .all(|id| produced.contains(id))
 }
 
 /// Render the multi-turn Jinja history with the verbatim assistant-turn token
@@ -3169,15 +3212,28 @@ pub fn qwen_jinja_cached_history_tokens(
             tools,
             tool_turns,
             |msg| {
-                let hit =
-                    qwen_jinja_lookup_turn(&mut *asst_turn_cache, msg, &primer).filter(|turn| {
-                        tool_turns != hipfire_runtime::prompt_frame::ToolTurnSplice::WholeBody
-                            || msg.tool_calls.is_empty()
-                            || qwen_whole_body_prose_matches(tok, turn, &msg.content)
-                    });
+                let include_call_ids = frame.template.contains("[TOOL_CALLS]");
+                let hit = qwen_jinja_lookup_turn_for(
+                    &mut *asst_turn_cache,
+                    msg,
+                    &primer,
+                    include_call_ids,
+                )
+                .filter(|turn| {
+                    tool_turns != hipfire_runtime::prompt_frame::ToolTurnSplice::WholeBody
+                        || msg.tool_calls.is_empty()
+                        || (qwen_whole_body_prose_matches(tok, turn, &msg.content)
+                            && qwen_whole_body_call_ids_match(
+                                tok,
+                                frame.template,
+                                turn,
+                                &msg.tool_calls,
+                            ))
+                });
                 if trace_cache {
                     let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
-                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+                    let fp =
+                        asst_turn_fingerprint_for(&normalized, &msg.tool_calls, include_call_ids);
                     eprintln!(
                 "[qwen-cache jinja lookup {trace_label}] fp={:#018x} role={:?} primer={} hit={}",
                 fp,
@@ -7794,7 +7850,17 @@ pub fn legacy_asst_turn_action(
 
 /// Publish a legacy turn: content-only full body under the action's fingerprint.
 pub fn store_legacy_asst_turn(m: &mut LoadedModel, action: &TurnCacheAction, cached_seq: Vec<u32>) {
-    let _ = apply_turn_cache_action(
+    store_legacy_asst_turn_for(m, action, cached_seq, false);
+}
+
+/// [`store_legacy_asst_turn`] with the `[TOOL_CALLS]` id key.
+pub fn store_legacy_asst_turn_for(
+    m: &mut LoadedModel,
+    action: &TurnCacheAction,
+    cached_seq: Vec<u32>,
+    include_call_ids: bool,
+) {
+    let _ = apply_turn_cache_action_for(
         |fp, seq| {
             if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
                 .ok()
@@ -7822,6 +7888,7 @@ pub fn store_legacy_asst_turn(m: &mut LoadedModel, action: &TurnCacheAction, cac
         },
         action,
         cached_seq,
+        include_call_ids,
     );
 }
 
@@ -8076,6 +8143,33 @@ pub fn qwen_dflash_cache_seq(
         _ => cached_seq = streamed[..body_len_before_trim].to_vec(),
     }
     cached_seq
+}
+
+/// Drop a trailing eos, and its newline trailer, when
+/// [`qwen_dflash_cache_seq`] left them in place. A Mistral stop is `</s>`,
+/// not `<|im_end|>`, and the chat template appends `eos_token` again on the
+/// substituted assistant turn. A length-capped body that ends on a newline
+/// has no eos behind that newline, so it stays verbatim.
+pub fn llama_tool_cache_seq(
+    streamed: &[u32],
+    im_end: Option<u32>,
+    eos_ids: &[u32],
+    nl: &std::collections::HashSet<u32>,
+) -> Vec<u32> {
+    let trimmed = qwen_dflash_cache_seq(streamed, im_end, nl);
+    if trimmed.len() != streamed.len() {
+        return trimmed;
+    }
+    for &eos in eos_ids {
+        if im_end == Some(eos) {
+            continue;
+        }
+        let next = qwen_dflash_cache_seq(streamed, Some(eos), nl);
+        if next.len() != streamed.len() {
+            return next;
+        }
+    }
+    trimmed
 }
 
 pub fn spec_host_advance_after_step(
@@ -9235,7 +9329,9 @@ mod qwen_history_chain_tests {
         qwen_dflash_wire_terminal, qwen_jinja_cached_history_tokens, qwen_jinja_lookup_turn,
     };
     use crate::ar::{qwen_ar_cache_action, QwenArRouteFinish, QwenArTerminalCause};
-    use hipfire_engine::turn_cache::{apply_turn_cache_action, asst_turn_fingerprint};
+    use hipfire_engine::turn_cache::{
+        apply_turn_cache_action, asst_turn_fingerprint, asst_turn_fingerprint_for,
+    };
     use hipfire_loader::AsstTurnCache;
     use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
     use hipfire_runtime::spec::FinishSummary;
@@ -10388,6 +10484,257 @@ mod qwen_history_chain_tests {
         assert!(
             !spec_store(&truncated, true, false),
             "truncated length body"
+        );
+    }
+
+    fn weather_call(id: Option<&str>) -> hipfire_runtime::prompt_frame::ToolCall {
+        hipfire_runtime::prompt_frame::ToolCall {
+            id: id.map(str::to_owned),
+            name: "get_weather".to_owned(),
+            arguments: serde_json::json!({"city": "SF"}),
+            rendered_body: None,
+        }
+    }
+
+    fn tool_history(content: &str, id: &str) -> Vec<Message> {
+        let mut assistant = msg(Role::Assistant, content);
+        assistant.tool_calls.push(weather_call(Some(id)));
+        let mut tool = msg(Role::Tool, "72F");
+        tool.tool_call_id = Some(id.to_owned());
+        vec![msg(Role::User, "weather?"), assistant, tool]
+    }
+
+    fn store_body(
+        cache: &mut AsstTurnCache,
+        tok: &Tokenizer,
+        template: &str,
+        calls: &[hipfire_runtime::prompt_frame::ToolCall],
+        body: &str,
+    ) {
+        let fp = asst_turn_fingerprint_for("", calls, template.contains("[TOOL_CALLS]"));
+        cache.insert(
+            fp,
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: None,
+                tools: Vec::new(),
+                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                    token_ids: tok.encode(body),
+                    text: String::new(),
+                }),
+            },
+        );
+    }
+
+    fn replay(
+        tok: &Tokenizer,
+        template: &str,
+        hist: &[Message],
+        cache: &mut AsstTurnCache,
+    ) -> String {
+        let frame = JinjaChatFrame {
+            tokenizer: tok,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let cold = tok.encode(&frame.render_history(hist, None, None).expect("cold render"));
+        let tokens = qwen_jinja_cached_history_tokens(
+            &frame,
+            cache,
+            &cold,
+            hist,
+            None,
+            hipfire_runtime::prompt_frame::ToolTurnSplice::WholeBody,
+            "llama-tool",
+            None,
+        )
+        .expect("cached history");
+        tok.decode(&tokens)
+    }
+
+    const MISTRAL_TOOL_TEMPLATE: &str = "{%- for message in messages %}{%- if message.tool_calls %}{{- '[TOOL_CALLS] [' }}{%- for tool_call in message.tool_calls %}{%- set out = tool_call.function|tojson %}{{- out[:-1] }}{%- if not tool_call.id is defined or tool_call.id|length < 9 %}{{- raise_exception('Tool call IDs should be alphanumeric strings with length >= 9!') }}{%- endif %}{{- ', \"id\": \"' + tool_call.id[-9:] + '\"}' }}{%- if not loop.last %}{{- ', ' }}{%- endif %}{%- endfor %}{{- ']' }}{%- elif message.role == 'assistant' %}{{- message.content + eos_token }}{%- else %}{{- message.content }}{%- endif %}{%- endfor %}";
+
+    const QWEN_TOOL_TEMPLATE: &str = "{%- for message in messages %}{%- if message.tool_calls %}{{- '<tool_call>' + message.tool_calls[0].name + '</tool_call>' }}{%- else %}{{- message.content }}{%- endif %}{%- endfor %}";
+
+    #[test]
+    fn llama_cached_tool_turn_does_not_replay_a_different_call_id() {
+        let tok = tokenizer();
+        let mut cache = AsstTurnCache::new_from_env();
+        let stored = [weather_call(Some("abc123xyz"))];
+        store_body(
+            &mut cache,
+            &tok,
+            MISTRAL_TOOL_TEMPLATE,
+            &stored,
+            "CACHEDBODY [TOOL_CALLS][{\"id\":\"abc123xyz\"}]",
+        );
+        let hist = tool_history("", "def456uvw");
+        let text = replay(&tok, MISTRAL_TOOL_TEMPLATE, &hist, &mut cache);
+        assert!(
+            !text.contains("CACHEDBODY"),
+            "a different call id reused the cached body: {text}"
+        );
+        assert!(
+            !text.contains("abc123xyz"),
+            "replay kept the cached call id: {text}"
+        );
+        assert!(
+            text.contains("def456uvw"),
+            "the client call id was dropped: {text}"
+        );
+    }
+
+    #[test]
+    fn llama_cached_tool_turn_replays_the_matching_call() {
+        let tok = tokenizer();
+        let mut cache = AsstTurnCache::new_from_env();
+        let stored = [weather_call(Some("abc123xyz"))];
+        store_body(
+            &mut cache,
+            &tok,
+            MISTRAL_TOOL_TEMPLATE,
+            &stored,
+            "CACHEDBODY [TOOL_CALLS][{\"id\":\"abc123xyz\"}]",
+        );
+        let hist = tool_history("", "abc123xyz");
+        let text = replay(&tok, MISTRAL_TOOL_TEMPLATE, &hist, &mut cache);
+        assert!(
+            text.contains("CACHEDBODY"),
+            "the matching call missed the cached body: {text}"
+        );
+    }
+
+    #[test]
+    fn llama_cached_tool_turn_replays_echoed_prose() {
+        let tok = tokenizer();
+        let mut cache = AsstTurnCache::new_from_env();
+        let stored = [weather_call(Some("abc123xyz"))];
+        store_body(
+            &mut cache,
+            &tok,
+            MISTRAL_TOOL_TEMPLATE,
+            &stored,
+            "I'll check. [TOOL_CALLS][{\"id\":\"abc123xyz\"}] CACHEDBODY",
+        );
+        let hist = tool_history("I'll check. ", "abc123xyz");
+        let text = replay(&tok, MISTRAL_TOOL_TEMPLATE, &hist, &mut cache);
+        assert!(
+            text.contains("CACHEDBODY"),
+            "echoed prose before [TOOL_CALLS] missed the cached body: {text}"
+        );
+        assert!(text.contains("I'll check."), "prose was dropped: {text}");
+    }
+
+    #[test]
+    fn llama_cached_tool_turn_rejects_a_body_missing_the_call_id() {
+        let tok = tokenizer();
+        let mut cache = AsstTurnCache::new_from_env();
+        let stored = [weather_call(Some("abc123xyz"))];
+        store_body(
+            &mut cache,
+            &tok,
+            MISTRAL_TOOL_TEMPLATE,
+            &stored,
+            "CACHEDBODY",
+        );
+        let hist = tool_history("", "abc123xyz");
+        let text = replay(&tok, MISTRAL_TOOL_TEMPLATE, &hist, &mut cache);
+        assert!(
+            !text.contains("CACHEDBODY"),
+            "a body that lacks the call id was replayed: {text}"
+        );
+        assert!(text.contains("abc123xyz"), "client id missing: {text}");
+    }
+
+    #[test]
+    fn qwen_cached_tool_turn_ignores_call_id() {
+        let tok = tokenizer();
+        let mut cache = AsstTurnCache::new_from_env();
+        store_body(
+            &mut cache,
+            &tok,
+            QWEN_TOOL_TEMPLATE,
+            &[weather_call(None)],
+            "CACHEDBODY <tool_call>get_weather</tool_call>",
+        );
+        let mut assistant = msg(Role::Assistant, "");
+        assistant.tool_calls.push(weather_call(Some("def456uvw")));
+        let hist = vec![msg(Role::User, "weather?"), assistant];
+        let text = replay(&tok, QWEN_TOOL_TEMPLATE, &hist, &mut cache);
+        assert!(
+            text.contains("CACHEDBODY"),
+            "a Qwen tool turn missed because the call id differed: {text}"
+        );
+    }
+
+    #[test]
+    fn llama_cached_tool_turn_strips_eos_before_the_template_appends_it() {
+        let tok = tokenizer();
+        let eos = tok.special_token_id("<|endoftext|>").expect("eot");
+        let im_end = tok.special_token_id("<|im_end|>");
+        assert_ne!(Some(eos), im_end);
+        let body = "CACHEDBODY [TOOL_CALLS][{\"id\":\"abc123xyz\"}]";
+        let mut streamed = tok.encode(body);
+        streamed.push(eos);
+        let nl: std::collections::HashSet<u32> = tok.encode("\n").into_iter().collect();
+        let cached = super::llama_tool_cache_seq(&streamed, im_end, &[eos, tok.eos_id], &nl);
+        assert!(!cached.contains(&eos), "eos stayed in the cached body");
+        assert_eq!(cached, tok.encode(body));
+        let mut cache = AsstTurnCache::new_from_env();
+        let stored = [weather_call(Some("abc123xyz"))];
+        cache.insert(
+            asst_turn_fingerprint_for("", &stored, true),
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: None,
+                tools: Vec::new(),
+                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                    token_ids: cached,
+                    text: String::new(),
+                }),
+            },
+        );
+        let text = replay(
+            &tok,
+            MISTRAL_TOOL_TEMPLATE,
+            &tool_history("", "abc123xyz"),
+            &mut cache,
+        );
+        assert!(text.contains("CACHEDBODY"), "trimmed body missed: {text}");
+        assert!(
+            !text.contains("<|endoftext|>"),
+            "the stopping token was replayed and the template added another terminator: {text}"
+        );
+        assert_eq!(text.matches("<|im_end|>").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn llama_tool_cache_seq_keeps_a_length_newline() {
+        let im_end = Some(1u32);
+        let eos = [9u32];
+        let nl: std::collections::HashSet<u32> = [7u32].into_iter().collect();
+        assert_eq!(
+            super::llama_tool_cache_seq(&[10, 11, 9], im_end, &eos, &nl),
+            vec![10, 11]
+        );
+        assert_eq!(
+            super::llama_tool_cache_seq(&[10, 11, 9, 7], im_end, &eos, &nl),
+            vec![10, 11]
+        );
+        assert_eq!(
+            super::llama_tool_cache_seq(&[10, 11, 1, 7], im_end, &eos, &nl),
+            vec![10, 11]
+        );
+        assert_eq!(
+            super::llama_tool_cache_seq(&[10, 11, 7], im_end, &eos, &nl),
+            vec![10, 11, 7]
+        );
+        assert_eq!(
+            super::llama_tool_cache_seq(&[10, 11, 12], im_end, &eos, &nl),
+            vec![10, 11, 12]
         );
     }
 }
