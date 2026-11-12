@@ -7098,14 +7098,16 @@ pub fn generate(
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
             ClientTerminalDecision::Commit => {
-                // Same store decision as the legacy spec route.
+                // Same store decision as the legacy spec route. The next turn
+                // looks the entry up by the client tool_calls. Length has
+                // already cleared the span, so that turn is not stored.
                 let decoded_full = tokenizer.decode(&streamed_tokens);
                 let action = crate::qwen::legacy_asst_turn_action(
                     !hit_stop,
                     open_think,
                     started_in_think,
                     &decoded_full,
-                    &[],
+                    tool_span.calls(),
                 );
                 if action.store {
                     let nl_set: std::collections::HashSet<u32> = nl.iter().copied().collect();

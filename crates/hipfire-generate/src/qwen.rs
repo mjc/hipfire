@@ -11870,6 +11870,36 @@ mod legacy_asst_turn_store_tests {
     }
 
     #[test]
+    fn released_calls_store_under_the_call_fingerprint() {
+        use hipfire_runtime::prompt_frame::ToolCall;
+        let calls = vec![ToolCall {
+            id: Some("abc123xyz".into()),
+            name: "ping".into(),
+            arguments: serde_json::json!({"x": 1}),
+            rendered_body: None,
+        }];
+        let raw = "I'll check. [TOOL_CALLS][{\"name\":\"ping\",\"arguments\":{\"x\":1}}]";
+        let stored = legacy_asst_turn_action(false, false, false, raw, &calls);
+        let text_only = legacy_asst_turn_action(false, false, false, raw, &[]);
+        assert!(stored.store);
+        assert_eq!(stored.tool_calls.len(), 1);
+        assert_eq!(stored.tool_calls[0].name, "ping");
+        assert_eq!(stored.tool_calls[0].arguments["x"], 1);
+        assert!(text_only.store);
+        let mut cache = HashMap::new();
+        let fp = store(&mut cache, &stored, vec![4, 5]).expect("tool turn stores");
+        assert_eq!(
+            fp,
+            hipfire_engine::turn_cache::asst_turn_fingerprint("", &calls)
+        );
+        assert_ne!(
+            fp,
+            hipfire_engine::turn_cache::asst_turn_fingerprint(&text_only.fingerprint_text, &[])
+        );
+        assert!(!legacy_asst_turn_action(true, false, false, raw, &calls).store);
+    }
+
+    #[test]
     fn length_and_open_think_skip() {
         assert!(!action(true, false, false, "Hello").store);
         assert!(!action(false, true, false, "Hello").store);
