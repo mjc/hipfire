@@ -7240,7 +7240,9 @@ fn llama_drain_tool_text(
             break;
         }
         if tool_span.in_body() {
-            let visible = tool_span.push(held)?;
+            // Stop after this array. The remainder may open a think span, and
+            // a marker inside that span is not a call.
+            let visible = tool_span.push_one_span(held)?;
             held.clear();
             llama_account_pushed_span(stdout, id, think, tool_span, visible, held);
             if tool_span.in_body() || held.is_empty() {
@@ -7276,7 +7278,7 @@ fn llama_drain_tool_text(
                     llama_emit_through_think(stdout, id, think, &held[..tool]);
                     held.drain(..tool);
                 }
-                let visible = tool_span.push(held)?;
+                let visible = tool_span.push_one_span(held)?;
                 held.clear();
                 llama_account_pushed_span(stdout, id, think, tool_span, visible, held);
                 if tool_span.in_body() || held.is_empty() {
@@ -7626,6 +7628,37 @@ mod llama_ar_tool_wire_tests {
         assert!(text.contains("end"));
         assert!(!text.contains("TOOL_CALLS"));
         assert!(!text.contains("pong"));
+    }
+
+    #[test]
+    fn reasoning_after_a_closed_call_stays_reasoning() {
+        let raw = r#"[TOOL_CALLS][{"name":"ping"}]<think>[TOOL_CALLS][{"name":"reasoning_only"}]</think>After"#;
+        let (out, span) = drive("llama-think-after", [raw.as_bytes()], LlamaToolEnd::Stop);
+        assert_eq!(span.calls().len(), 1);
+        assert_eq!(span.calls()[0].name, "ping");
+        let text = String::from_utf8(out).unwrap();
+        let reasoning = text.find("\"type\":\"reasoning\"").expect("reasoning");
+        let after = text.find("After").expect("content after the think span");
+        assert!(reasoning < after);
+        assert!(text.contains("reasoning_only"));
+    }
+
+    #[test]
+    fn think_span_in_the_chunk_that_closes_a_call_is_not_a_call() {
+        let (out, span) = drive(
+            "llama-think-close",
+            [
+                br#"[TOOL_CALLS][{"name":"ping","arguments":{}"#.as_slice(),
+                br#"}]<think>[TOOL_CALLS][{"name":"reasoning_only"}]</think>After"#.as_slice(),
+            ],
+            LlamaToolEnd::Stop,
+        );
+        assert_eq!(span.calls().len(), 1);
+        assert_eq!(span.calls()[0].name, "ping");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"type\":\"reasoning\""));
+        assert!(text.contains("reasoning_only"));
+        assert!(text.contains("After"));
     }
 
     #[test]
