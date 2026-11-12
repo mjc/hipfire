@@ -3109,11 +3109,13 @@ fn qwen_accept_tool_argument_replay(
 /// Whether a whole-body tool-turn hit may replay its stored prose. The cache
 /// key of a tool-call turn covers the calls, because clients often echo such
 /// turns with empty content. A client that echoes non-empty content must echo
-/// the producer's visible prose. A llama turn streams the text around each
-/// `[TOOL_CALLS]` array. A Qwen turn echoes the text before the first
-/// `<tool_call>`.
+/// the producer's visible prose. The template chooses the parser: a
+/// `[TOOL_CALLS]` template streams the text around each array, and a Qwen
+/// template echoes the text before the first `<tool_call>`. A marker inside
+/// an argument does not change that choice.
 fn qwen_whole_body_prose_matches(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    template: &str,
     turn: &hipfire_runtime::prompt_frame::CachedAssistantTurn,
     echoed: &str,
 ) -> bool {
@@ -3125,12 +3127,12 @@ fn qwen_whole_body_prose_matches(
         return false;
     };
     let produced = normalize_asst_turn_for_fingerprint(&tokenizer.decode(&body.token_ids));
-    let prose = visible_replay_prose(&produced);
+    let prose = visible_replay_prose(template, &produced);
     prose.trim() == echoed.trim()
 }
 
-fn visible_replay_prose(produced: &str) -> String {
-    if produced.contains("[TOOL_CALLS]") {
+fn visible_replay_prose(template: &str, produced: &str) -> String {
+    if template.contains("[TOOL_CALLS]") {
         if let Ok(visible) = hipfire_runtime::llama_tool_span::visible_llama_tool_prose(produced) {
             return visible;
         }
@@ -3232,7 +3234,7 @@ pub fn qwen_jinja_cached_history_tokens(
                 .filter(|turn| {
                     tool_turns != hipfire_runtime::prompt_frame::ToolTurnSplice::WholeBody
                         || msg.tool_calls.is_empty()
-                        || (qwen_whole_body_prose_matches(tok, turn, &msg.content)
+                        || (qwen_whole_body_prose_matches(tok, frame.template, turn, &msg.content)
                             && qwen_whole_body_call_ids_match(
                                 tok,
                                 frame.template,
@@ -10712,6 +10714,28 @@ mod qwen_history_chain_tests {
         assert!(
             text.contains("CACHEDBODY"),
             "a Qwen tool turn missed because the call id differed: {text}"
+        );
+    }
+
+    #[test]
+    fn qwen_argument_text_does_not_select_the_llama_prose_parser() {
+        let tok = tokenizer();
+        let mut cache = AsstTurnCache::new_from_env();
+        let body = "Before <tool_call>\n<function=echo>\n<parameter=text>\n[TOOL_CALLS][{\"name\":\"ping\",\"arguments\":{}}]\nCACHEDBODY\n</parameter>\n</function>\n</tool_call>";
+        store_body(
+            &mut cache,
+            &tok,
+            QWEN_TOOL_TEMPLATE,
+            &[weather_call(None)],
+            body,
+        );
+        let mut assistant = msg(Role::Assistant, "Before ");
+        assistant.tool_calls.push(weather_call(Some("call_0")));
+        let hist = vec![msg(Role::User, "weather?"), assistant];
+        let text = replay(&tok, QWEN_TOOL_TEMPLATE, &hist, &mut cache);
+        assert!(
+            text.contains("CACHEDBODY"),
+            "a [TOOL_CALLS] string inside a Qwen argument missed the cached body: {text}"
         );
     }
 
