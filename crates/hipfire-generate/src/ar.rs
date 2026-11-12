@@ -1054,16 +1054,19 @@ impl GenerationRoute {
     /// branch never serves a tools request, so tools always decode AR.
     ///
     /// `LlamaAr` is admitted on the same legacy contract. The llama decode
-    /// path withholds a completed `[TOOL_CALLS][{name, arguments, id?}]` span
+    /// path withholds a completed `[TOOL_CALLS][{name, arguments, id}]` span
     /// from the content stream and stages those calls on a
     /// `finish_reason == "tool_calls"` terminal, emitting the `tool_calls`
     /// event before commit. That is the span the arch-0 Mistral v3 chat
-    /// template writes. A tools request is refused before prefill when Jinja
-    /// chat is off, the load embeds no chat template, that template has no
-    /// `[TOOL_CALLS]` span, or rendering the template fails. The Plain frame
-    /// has nowhere to put the tool definitions. `LlamaSpec` is a separate
-    /// route and stays refused. A length cap does not release calls. An
-    /// unclosed span at eos is a validation error and produces no done.
+    /// template writes. A released call id is at least 9 characters, which is
+    /// what that template requires on the next turn. A shorter or missing id
+    /// is a validation error and produces no done. A tools request is refused
+    /// before prefill when Jinja chat is off, the load embeds no chat
+    /// template, that template has no `[TOOL_CALLS]` span, or rendering the
+    /// template fails. The Plain frame has nowhere to put the tool
+    /// definitions. `LlamaSpec` is a separate route and stays refused. A
+    /// length cap does not release calls. An unclosed span at eos is a
+    /// validation error and produces no done.
     pub const fn supports_tools(self) -> bool {
         matches!(
             self,
@@ -7089,42 +7092,49 @@ pub fn generate(
         }
         if tool_terminal.release_calls {
             // Legacy clients read the event. The event precedes commit.
-            llama_emit_ready_tool_calls(
+            // A short id would make the next Mistral render raise, so the
+            // turn stops here instead of publishing the call.
+            if let Err(error) = llama_emit_ready_tool_calls(
                 stdout,
                 id,
                 &mut pending_done,
                 tool_terminal.finish_reason,
                 tool_span.calls(),
-            );
+            ) {
+                llama_reject_tool_span(
+                    &mut m.conversation_tokens,
+                    llama_committed_len,
+                    stdout,
+                    id,
+                    &error,
+                );
+                return;
+            }
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
             ClientTerminalDecision::Commit => {
                 // Same store decision as the legacy spec route. The next turn
                 // looks the entry up by the client tool_calls. Length has
                 // already cleared the span, so that turn is not stored.
-                let decoded_full = tokenizer.decode(&streamed_tokens);
-                let action = crate::qwen::legacy_asst_turn_action(
+                // The fingerprint is the decode of the stored tokens, so a
+                // stopping eos is absent from both.
+                let nl_set: std::collections::HashSet<u32> = nl.iter().copied().collect();
+                let include_call_ids = m
+                    .chat_template
+                    .as_deref()
+                    .is_some_and(|template| template.contains("[TOOL_CALLS]"));
+                let (action, cached_seq) = crate::qwen::llama_stored_turn_action(
+                    tokenizer,
+                    &streamed_tokens,
+                    im_end_token,
+                    &[config.eos_token, tokenizer.eos_id],
+                    &nl_set,
                     !hit_stop,
                     open_think,
                     started_in_think,
-                    &decoded_full,
                     tool_span.calls(),
                 );
                 if action.store {
-                    let nl_set: std::collections::HashSet<u32> = nl.iter().copied().collect();
-                    // The replayed body contains the call id, and the template
-                    // appends eos again, so the key includes the id and the
-                    // stored tokens omit the stopping eos.
-                    let include_call_ids = m
-                        .chat_template
-                        .as_deref()
-                        .is_some_and(|template| template.contains("[TOOL_CALLS]"));
-                    let cached_seq = crate::qwen::llama_tool_cache_seq(
-                        &streamed_tokens,
-                        im_end_token,
-                        &[config.eos_token, tokenizer.eos_id],
-                        &nl_set,
-                    );
                     crate::qwen::store_legacy_asst_turn_for(
                         m,
                         &action,
@@ -7391,13 +7401,26 @@ fn llama_emit_ready_tool_calls(
     pending_done: &mut serde_json::Value,
     finish_reason: &str,
     calls: &[hipfire_runtime::prompt_frame::ToolCall],
-) {
+) -> Result<(), hipfire_runtime::llama_tool_span::LlamaToolSpanError> {
     if finish_reason != "tool_calls" {
-        return;
+        return Ok(());
+    }
+    // The Mistral v3 template raises when a replayed id is missing or
+    // shorter than 9 characters. Refuse the release before any event.
+    if calls
+        .iter()
+        .any(|call| call.id.as_deref().map(str::len).unwrap_or(0) < 9)
+    {
+        return Err(
+            hipfire_runtime::llama_tool_span::LlamaToolSpanError::Malformed(
+                "tool call id must be at least 9 characters",
+            ),
+        );
     }
     stage_terminal_tool_calls(pending_done, finish_reason, calls);
     emit_tool_calls_event(stdout, id, calls);
     let _ = stdout.flush();
+    Ok(())
 }
 
 fn llama_tool_span_error(
@@ -7516,7 +7539,8 @@ mod llama_ar_tool_wire_tests {
             &mut pending_done,
             terminal.finish_reason,
             span.calls(),
-        );
+        )
+        .expect("nine-character id");
         let text = String::from_utf8(out).unwrap();
         let tool_at = text
             .find("\"type\":\"tool_calls\"")
@@ -7696,6 +7720,42 @@ mod llama_ar_tool_wire_tests {
         let docs = text.find("[docs].").expect("bracket stays with docs");
         assert!(see < docs);
         assert!(!text.contains("docs].["));
+    }
+
+    #[test]
+    fn llama_release_refuses_a_short_call_id() {
+        let _guard = super::generation_test_lock();
+        set_active_attempt_id(44);
+        for raw in [
+            r#"[TOOL_CALLS][{"name":"ping","id":"short"}]"#,
+            r#"[TOOL_CALLS][{"name":"ping"}]"#,
+        ] {
+            activate_terminal_control("llama-short-id", 44);
+            let (mut out, span) = drive("llama-short-id", [raw.as_bytes()], LlamaToolEnd::Stop);
+            assert_eq!(span.calls().len(), 1);
+            let mut pending = serde_json::json!({"type": "done", "finish_reason": "tool_calls"});
+            let before = out.len();
+            let error = llama_emit_ready_tool_calls(
+                &mut out,
+                "llama-short-id",
+                &mut pending,
+                "tool_calls",
+                span.calls(),
+            )
+            .expect_err("short or missing id");
+            assert_eq!(out.len(), before);
+            assert!(pending.get("calls").is_none());
+            let mut tokens = vec![7, 8, 9];
+            llama_reject_tool_span(&mut tokens, 1, &mut out, "llama-short-id", &error);
+            assert_eq!(tokens, vec![7]);
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("at least 9 characters"), "{text}");
+            assert!(text.contains("\"type\":\"error\""));
+            assert!(!text.contains("\"type\":\"tool_calls\""));
+            assert!(!text.contains("\"type\":\"done\""));
+            clear_terminal_control();
+        }
+        set_active_attempt_id(0);
     }
 
     #[test]

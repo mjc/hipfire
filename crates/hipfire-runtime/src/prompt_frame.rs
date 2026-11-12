@@ -967,7 +967,10 @@ pub fn expand_image_slots(messages: &[Message], replacement: &str) -> Vec<Messag
 /// nine characters of `tool_call.id`. With no `function` key that filter emits
 /// JSON `null`, and the next turn sees `nul` instead of the call. This
 /// replaces each assistant call with `function: {name, arguments}` and copies
-/// a present id onto that object.
+/// a present id onto that object. The tool-call branch of that template does
+/// not read `message.content`. This projection leaves that prose on the
+/// message. A cache hit still splices the original body, which already
+/// contains it.
 pub fn llama_template_messages(messages: &[Message]) -> Result<Vec<serde_json::Value>, String> {
     let mut values = Vec::with_capacity(messages.len());
     for message in messages {

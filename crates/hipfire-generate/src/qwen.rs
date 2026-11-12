@@ -8184,6 +8184,33 @@ pub fn llama_tool_cache_seq(
     trimmed
 }
 
+/// Fingerprint and stored tokens for one llama assistant turn.
+///
+/// Both come from the eos-trimmed sequence. A client echoes the visible
+/// prose, and the template appends the stopping token again on replay.
+pub(crate) fn llama_stored_turn_action(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    streamed: &[u32],
+    im_end: Option<u32>,
+    eos_ids: &[u32],
+    nl: &std::collections::HashSet<u32>,
+    hit_length: bool,
+    open_think: bool,
+    started_in_think: bool,
+    wire_calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) -> (TurnCacheAction, Vec<u32>) {
+    let cached_seq = llama_tool_cache_seq(streamed, im_end, eos_ids, nl);
+    let decoded = tokenizer.decode(&cached_seq);
+    let action = legacy_asst_turn_action(
+        hit_length,
+        open_think,
+        started_in_think,
+        &decoded,
+        wire_calls,
+    );
+    (action, cached_seq)
+}
+
 pub fn spec_host_advance_after_step(
     mut position: usize,
     mut generated: usize,
@@ -10805,6 +10832,39 @@ mod qwen_history_chain_tests {
             vec![10, 11, 12]
         );
     }
+
+    #[test]
+    fn llama_release_fingerprint_drops_stopping_eos() {
+        let tok = tokenizer();
+        let eos = tok.special_token_id("<|endoftext|>").expect("eot");
+        let im_end = tok.special_token_id("<|im_end|>");
+        let body = "Hello there.";
+        let mut streamed = tok.encode(body);
+        streamed.push(eos);
+        let nl: std::collections::HashSet<u32> = tok.encode("\n").into_iter().collect();
+        assert!(
+            tok.decode(&streamed).contains("<|endoftext|>"),
+            "the stopping piece has to be present before the trim"
+        );
+        let (action, cached) = super::llama_stored_turn_action(
+            &tok,
+            &streamed,
+            im_end,
+            &[eos, tok.eos_id],
+            &nl,
+            false,
+            false,
+            false,
+            &[],
+        );
+        assert!(action.store);
+        assert!(!cached.contains(&eos));
+        assert_eq!(action.fingerprint_text.trim(), body);
+        assert_eq!(
+            hipfire_engine::turn_cache::asst_turn_fingerprint(&action.fingerprint_text, &[]),
+            hipfire_engine::turn_cache::asst_turn_fingerprint(body, &[])
+        );
+    }
 }
 #[cfg(test)]
 mod pp_forward_order_tests {
@@ -12312,6 +12372,51 @@ mod legacy_asst_turn_store_tests {
             hipfire_engine::turn_cache::asst_turn_fingerprint(&text_only.fingerprint_text, &[])
         );
         assert!(!legacy_asst_turn_action(true, false, false, raw, &calls).store);
+    }
+
+    #[test]
+    fn llama_release_call_ids_use_distinct_store_keys() {
+        use hipfire_engine::turn_cache::apply_turn_cache_action_for;
+        use hipfire_runtime::prompt_frame::ToolCall;
+        let call = |id: &str| {
+            legacy_asst_turn_action(
+                false,
+                false,
+                false,
+                "ignored",
+                &[ToolCall {
+                    id: Some(id.to_owned()),
+                    name: "ping".into(),
+                    arguments: serde_json::json!({"x": 1}),
+                    rendered_body: None,
+                }],
+            )
+        };
+        let a = call("abc123xyz");
+        let b = call("xyz123abc");
+        let mut keyed = HashMap::new();
+        let left = apply_turn_cache_action_for(
+            |fp, seq| drop(keyed.insert(fp, seq)),
+            &a,
+            vec![4, 5],
+            true,
+        )
+        .expect("id-aware store");
+        let right = apply_turn_cache_action_for(
+            |fp, seq| drop(keyed.insert(fp, seq)),
+            &b,
+            vec![6, 7],
+            true,
+        )
+        .expect("id-aware store");
+        assert_ne!(left, right);
+        assert_eq!(keyed.len(), 2);
+        let mut plain = HashMap::new();
+        let without_ids = store(&mut plain, &a, vec![4, 5]).expect("id-free store");
+        assert_eq!(
+            without_ids,
+            store(&mut plain, &b, vec![6, 7]).expect("id-free store")
+        );
     }
 
     #[test]
