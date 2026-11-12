@@ -906,6 +906,9 @@ impl Lfm2MoeWeights {
         let moe_inter = cfg.moe_intermediate_size;
         let n_exp = cfg.num_experts;
         let k_conv = cfg.conv_kernel_size;
+        #[cfg(unix)]
+        hfq.drop_mmap();
+        let _payload = hfq.preload_contiguous_payload();
         // Globals. embed_tokens is the shared (tied) lm_head.
         let (_eqt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
         let (embd_format, embed) = match _eqt {
@@ -1227,9 +1230,10 @@ impl Lfm2MoeWeights {
                 // widens to F32, which a view cannot express, so it keeps the
                 // per-expert path and stays resident.
                 let mut raws: Vec<RawExpertPayload> = Vec::with_capacity(n_exp);
-                if hfq.has_overlay() {
-                    // Overlay offsets belong to a second file. Preserve the
-                    // existing overlay-aware reads.
+                if hfq.has_overlay() || hfq.has_contiguous_payload() {
+                    // Overlay bytes live in a second file. A loaded payload
+                    // already holds the base tensors, so a parallel pread
+                    // would read the file again.
                     for slot in 0..n_exp {
                         let e = reap_ep.as_ref().map(|ep| ep.src(slot)).unwrap_or(slot);
                         let ep = format!("{p}.feed_forward.experts.{e}");

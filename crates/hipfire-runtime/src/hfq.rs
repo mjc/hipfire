@@ -748,6 +748,53 @@ impl SourceReaderImpl for HfqRangeReader {
     }
 }
 
+/// Indexed tensor bytes from one sequential read. `bytes[0]` is file offset `base`.
+struct ContiguousPayload {
+    base: usize,
+    bytes: Vec<u8>,
+}
+
+impl ContiguousPayload {
+    fn slice(&self, info: &HfqTensorInfo) -> Option<&[u8]> {
+        let start = info.data_offset.checked_sub(self.base)?;
+        let end = start.checked_add(info.data_size)?;
+        self.bytes.get(start..end)
+    }
+}
+
+/// Drops the contiguous payload when the load that asked for it finishes.
+pub struct ContiguousPayloadGuard<'a> {
+    file: &'a HfqFile,
+}
+
+impl Drop for ContiguousPayloadGuard<'_> {
+    fn drop(&mut self) {
+        self.file.clear_contiguous_payload();
+    }
+}
+
+/// `(file offset, length)` covering every range, or `None` when the ranges are
+/// empty or a hole between them is larger than 1 MiB.
+fn contiguous_span(ranges: &[(usize, usize)]) -> Option<(usize, usize)> {
+    if ranges.is_empty() {
+        return None;
+    }
+    let mut base = usize::MAX;
+    let mut end = 0usize;
+    let mut sum = 0usize;
+    for &(offset, size) in ranges {
+        let range_end = offset.checked_add(size)?;
+        base = base.min(offset);
+        end = end.max(range_end);
+        sum = sum.checked_add(size)?;
+    }
+    let span = end.checked_sub(base)?;
+    if span == 0 || span.saturating_sub(sum) > (1 << 20) {
+        return None;
+    }
+    Some((base, span))
+}
+
 /// Author-recommended sampling defaults baked into a .hfq's
 /// `generation_config` metadata, surfaced by [`HfqFile::recommended_sampling`].
 /// Each field is independently `Option` so the consumer can fall through to its
@@ -796,6 +843,9 @@ pub struct HfqFile {
     /// can't be evicted while the mapping exists (FADV_DONTNEED is ignored
     /// for mmap'd regions per Linux kernel docs).
     pread_buf: std::cell::RefCell<Vec<u8>>,
+    /// One sequential read of the indexed payload, when the tensors form a
+    /// single span. Empty unless [`Self::preload_contiguous_payload`] ran.
+    contiguous_payload: std::cell::RefCell<Option<ContiguousPayload>>,
     /// Whether tensor reads evict their pages after reading
     /// (`posix_fadvise(DONTNEED)`). Defaults to `true` — the historical
     /// behavior, required on unified-memory APUs where cached model pages
@@ -1576,6 +1626,7 @@ impl HfqFile {
             mq3v2_symmetric,
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
+            contiguous_payload: std::cell::RefCell::new(None),
             evict_page_cache: true,
             pages_resident_memo: std::cell::Cell::new(0),
             cache_warmup_covered: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1981,6 +2032,89 @@ impl HfqFile {
         self.tensor_data(name)
     }
 
+    /// Read the indexed payload in one sequential pass when the tensors sit in
+    /// one span. Later reads slice or copy that buffer. The guard drops the
+    /// buffer so a long-lived file does not keep the weights in host RAM.
+    pub fn preload_contiguous_payload(&self) -> ContiguousPayloadGuard<'_> {
+        self.fill_contiguous_payload();
+        ContiguousPayloadGuard { file: self }
+    }
+
+    pub fn has_contiguous_payload(&self) -> bool {
+        self.contiguous_payload.borrow().is_some()
+    }
+
+    /// Run `body` on one tensor's bytes. Uses the contiguous payload when it
+    /// is loaded, otherwise one positioned read.
+    pub fn with_tensor_bytes<R>(
+        &self,
+        name: &str,
+        body: impl FnOnce(&HfqTensorInfo, &[u8]) -> R,
+    ) -> Option<R> {
+        if self.overlay.is_none() {
+            let guard = self.contiguous_payload.borrow();
+            if let Some(payload) = guard.as_ref() {
+                let idx = self.resolve_idx(name)?;
+                let info = &self.tensors[idx];
+                let bytes = payload.slice(info)?;
+                return Some(body(info, bytes));
+            }
+        }
+        let (info, data) = self.tensor_data_vec(name)?;
+        Some(body(info, &data))
+    }
+
+    fn clear_contiguous_payload(&self) {
+        *self.contiguous_payload.borrow_mut() = None;
+    }
+
+    /// Copy one tensor out of the payload. `None` when no payload is loaded
+    /// or this tensor sits outside it, so the caller can fall back to a read.
+    fn copy_contiguous_tensor(&self, idx: usize) -> Option<Vec<u8>> {
+        let guard = self.contiguous_payload.borrow();
+        let payload = guard.as_ref()?;
+        let src = payload.slice(&self.tensors[idx])?;
+        let mut buf = Vec::with_capacity(src.len());
+        buf.extend_from_slice(src);
+        Some(buf)
+    }
+
+    fn fill_contiguous_payload(&self) {
+        if self.overlay.is_some() || self.contiguous_payload.borrow().is_some() {
+            return;
+        }
+        #[cfg(any(unix, windows))]
+        {
+            let ranges: Vec<(usize, usize)> = self
+                .tensors
+                .iter()
+                .map(|tensor| (tensor.data_offset, tensor.data_size))
+                .collect();
+            let Some((base, span)) = contiguous_span(&ranges) else {
+                eprintln!("hfq: tensor ranges are not one span; reading each tensor");
+                return;
+            };
+            let mut bytes = vec![0u8; span];
+            let (read, _) = read_positional_exact(
+                |chunk, at| file_read_at(&self._file, chunk, at),
+                base as u64,
+                &mut bytes,
+            );
+            if read != span {
+                eprintln!(
+                    "hfq: contiguous read short ({read} of {span} bytes); reading each tensor"
+                );
+                return;
+            }
+            self.drop_pages_range(base, span);
+            eprintln!(
+                "hfq: read {} tensors ({span} bytes) in one pass",
+                self.tensors.len()
+            );
+            *self.contiguous_payload.borrow_mut() = Some(ContiguousPayload { base, bytes });
+        }
+    }
+
     /// Read tensor data using the best available path:
     /// - Unix / Windows: positioned read (`pread` / `seek_read`), independent
     ///   of the mmap, so it works after `drop_mmap()`; unix also fadvise_dontneeds
@@ -1998,6 +2132,10 @@ impl HfqFile {
             }
         }
         let idx = self.resolve_idx(name)?;
+        if let Some(copied) = self.copy_contiguous_tensor(idx) {
+            return Some((&self.tensors[idx], copied));
+        }
+
         let info = &self.tensors[idx];
 
         #[cfg(any(unix, windows))]
@@ -5777,5 +5915,29 @@ mod mq3v2_symmetric_tests {
             !f.mq3v2_symmetric(),
             "asymmetric ladder base must report marker=false"
         );
+    }
+}
+
+#[cfg(test)]
+mod contiguous_span_tests {
+    use super::contiguous_span;
+
+    #[test]
+    fn accepts_padding_under_a_mebibyte() {
+        assert_eq!(
+            contiguous_span(&[(100, 10), (114, 20)]).unwrap(),
+            (100, 34)
+        );
+    }
+
+    #[test]
+    fn rejects_a_hole_past_a_mebibyte() {
+        let hole = (1 << 20) + 1;
+        assert!(contiguous_span(&[(0, 10), (10 + hole, 10)]).is_none());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(contiguous_span(&[]).is_none());
     }
 }
