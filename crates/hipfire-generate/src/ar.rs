@@ -7202,6 +7202,26 @@ fn llama_earliest_think_marker(text: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// `push` returns prose and may already be inside the next call, or back in
+/// prose with a `[TOOL_CALLS]` prefix still in the splitter. Prose before an
+/// open body is emitted. A prose prefix comes back into `held` so the next
+/// chunk stays attached to it.
+fn llama_account_pushed_span(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    think: &mut ThinkOutputRouter,
+    tool_span: &mut hipfire_runtime::llama_tool_span::LlamaToolSplitter,
+    visible: String,
+    held: &mut String,
+) {
+    if tool_span.in_body() {
+        llama_emit_through_think(stdout, id, think, &visible);
+        return;
+    }
+    held.push_str(&visible);
+    held.push_str(&tool_span.take_prose_hold());
+}
+
 /// Classify `held`. A new `[TOOL_CALLS]` span starts only on the content
 /// channel. Bytes inside an open array are not scanned for think markers,
 /// so a `</think>` in an argument cannot close reasoning or split the call.
@@ -7220,10 +7240,10 @@ fn llama_drain_tool_text(
         if tool_span.in_body() {
             let visible = tool_span.push(held)?;
             held.clear();
-            if visible.is_empty() {
+            llama_account_pushed_span(stdout, id, think, tool_span, visible, held);
+            if tool_span.in_body() || held.is_empty() {
                 break;
             }
-            held.push_str(&visible);
             continue;
         }
         if think.in_think() {
@@ -7256,11 +7276,11 @@ fn llama_drain_tool_text(
                 }
                 let visible = tool_span.push(held)?;
                 held.clear();
-                if !visible.is_empty() {
-                    held.push_str(&visible);
-                    continue;
+                llama_account_pushed_span(stdout, id, think, tool_span, visible, held);
+                if tool_span.in_body() || held.is_empty() {
+                    break;
                 }
-                break;
+                continue;
             }
         }
         if let Some((at, len)) = think_at {
@@ -7561,6 +7581,69 @@ mod llama_ar_tool_wire_tests {
         assert!(text.contains("ping"));
         assert!(!text.contains("get_weather"));
         assert!(!text.contains("\"type\":\"token\""));
+    }
+
+    #[test]
+    fn second_span_survives_the_chunk_that_closes_the_first() {
+        let (out, span) = drive(
+            "llama-two",
+            [
+                br#"Before [TOOL_CALLS][{"name":"ping","arguments":{}"#.as_slice(),
+                br#"}] See [TOOL_CALLS][{"name":"pong"}"#.as_slice(),
+                br#"] After"#.as_slice(),
+            ],
+            LlamaToolEnd::Stop,
+        );
+        assert_eq!(span.calls().len(), 2);
+        assert_eq!(span.calls()[0].name, "ping");
+        assert_eq!(span.calls()[1].name, "pong");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("Before"));
+        assert!(text.contains("See"));
+        assert!(text.contains("After"));
+        assert!(!text.contains("[TOOL_CALLS]"));
+        assert!(!text.contains("pong"));
+    }
+
+    #[test]
+    fn partial_second_marker_stays_with_the_following_text() {
+        let (out, span) = drive(
+            "llama-partial",
+            [
+                br#"[TOOL_CALLS][{"name":"ping","arguments":{"x":1}"#.as_slice(),
+                br#"}] and [TOOL_"#.as_slice(),
+                br#"CALLS][{"name":"pong"}] end"#.as_slice(),
+            ],
+            LlamaToolEnd::Stop,
+        );
+        assert_eq!(span.calls().len(), 2);
+        assert_eq!(span.calls()[0].name, "ping");
+        assert_eq!(span.calls()[1].name, "pong");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("and"));
+        assert!(text.contains("end"));
+        assert!(!text.contains("TOOL_CALLS"));
+        assert!(!text.contains("pong"));
+    }
+
+    #[test]
+    fn bracket_after_a_call_stays_in_place() {
+        let (out, span) = drive(
+            "llama-bracket",
+            [
+                br#"[TOOL_CALLS][{"name":"ping"}"#.as_slice(),
+                br#"] See ["#.as_slice(),
+                br#"docs]."#.as_slice(),
+            ],
+            LlamaToolEnd::Stop,
+        );
+        assert_eq!(span.calls().len(), 1);
+        assert_eq!(span.calls()[0].name, "ping");
+        let text = String::from_utf8(out).unwrap();
+        let see = text.find("See").expect("prose");
+        let docs = text.find("[docs].").expect("bracket stays with docs");
+        assert!(see < docs);
+        assert!(!text.contains("docs].["));
     }
 
     #[test]

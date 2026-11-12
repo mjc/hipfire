@@ -174,6 +174,16 @@ impl LlamaToolSplitter {
     pub fn in_body(&self) -> bool {
         self.phase == Phase::Body
     }
+
+    /// Prose prefix held back so a split `[TOOL_CALLS]` marker can still match.
+    /// Empty while a body is open. The caller that classifies the following
+    /// prose takes this back; otherwise the prefix is stranded until finish.
+    pub fn take_prose_hold(&mut self) -> String {
+        if self.in_body() {
+            return String::new();
+        }
+        std::mem::take(&mut self.pending)
+    }
 }
 
 fn marker_prefix_suffix_len(text: &str) -> usize {
