@@ -7003,6 +7003,7 @@ pub fn generate(
             ) {
                 llama_reject_tool_span(
                     &mut m.conversation_tokens,
+                    &mut m.seq_pos,
                     llama_committed_len,
                     stdout,
                     id,
@@ -7015,6 +7016,21 @@ pub fn generate(
             tool_end,
             tool_span.calls().len(),
         );
+        // Refuse an unreplayable id before the cursor moves. The unclosed
+        // span returns on that same side of `seq_pos += generated`.
+        if tool_terminal.release_calls {
+            if let Err(error) = llama_replay_id_error(tool_span.calls()) {
+                llama_reject_tool_span(
+                    &mut m.conversation_tokens,
+                    &mut m.seq_pos,
+                    llama_committed_len,
+                    stdout,
+                    id,
+                    &error,
+                );
+                return;
+            }
+        }
         m.seq_pos += generated;
         crate::vision::vl_finish_think_routing(stdout, id, &mut filter, &mut think);
         let open_think = think.in_think();
@@ -7092,8 +7108,6 @@ pub fn generate(
         }
         if tool_terminal.release_calls {
             // Legacy clients read the event. The event precedes commit.
-            // A short id would make the next Mistral render raise, so the
-            // turn stops here instead of publishing the call.
             if let Err(error) = llama_emit_ready_tool_calls(
                 stdout,
                 id,
@@ -7103,6 +7117,7 @@ pub fn generate(
             ) {
                 llama_reject_tool_span(
                     &mut m.conversation_tokens,
+                    &mut m.seq_pos,
                     llama_committed_len,
                     stdout,
                     id,
@@ -7386,13 +7401,36 @@ fn llama_finish_tool_text(
 
 fn llama_reject_tool_span(
     conversation_tokens: &mut Vec<u32>,
+    seq_pos: &mut usize,
     committed_len: usize,
     stdout: &mut impl std::io::Write,
     id: &str,
     error: &hipfire_runtime::llama_tool_span::LlamaToolSpanError,
 ) {
     conversation_tokens.truncate(committed_len);
+    // Session decide treats `seq_pos != conversation.len()` as a cold start.
+    // Both stay on the prompt commit.
+    *seq_pos = committed_len;
     llama_tool_span_error(stdout, id, error);
+}
+
+/// The Mistral template's `|length` counts characters. A byte length of 9
+/// can still be fewer than 9 characters.
+fn llama_replay_id_error(
+    calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) -> Result<(), hipfire_runtime::llama_tool_span::LlamaToolSpanError> {
+    if calls
+        .iter()
+        .any(|call| call.id.as_deref().map(|id| id.chars().count()).unwrap_or(0) < 9)
+    {
+        Err(
+            hipfire_runtime::llama_tool_span::LlamaToolSpanError::Malformed(
+                "tool call id must be at least 9 characters",
+            ),
+        )
+    } else {
+        Ok(())
+    }
 }
 
 fn llama_emit_ready_tool_calls(
@@ -7405,18 +7443,9 @@ fn llama_emit_ready_tool_calls(
     if finish_reason != "tool_calls" {
         return Ok(());
     }
-    // The Mistral v3 template raises when a replayed id is missing or
-    // shorter than 9 characters. Refuse the release before any event.
-    if calls
-        .iter()
-        .any(|call| call.id.as_deref().map(str::len).unwrap_or(0) < 9)
-    {
-        return Err(
-            hipfire_runtime::llama_tool_span::LlamaToolSpanError::Malformed(
-                "tool call id must be at least 9 characters",
-            ),
-        );
-    }
+    // Refuse before any event. The generate path also checks before the
+    // cursor moves; this is the gate the wire test calls directly.
+    llama_replay_id_error(calls)?;
     stage_terminal_tool_calls(pending_done, finish_reason, calls);
     emit_tool_calls_event(stdout, id, calls);
     let _ = stdout.flush();
@@ -7583,8 +7612,10 @@ mod llama_ar_tool_wire_tests {
         )
         .expect_err("open span at eos");
         let mut tokens = vec![7, 8, 9];
-        llama_reject_tool_span(&mut tokens, 1, &mut out, "llama-open", &error);
+        let mut seq_pos = 1;
+        llama_reject_tool_span(&mut tokens, &mut seq_pos, 1, &mut out, "llama-open", &error);
         assert_eq!(tokens, vec![7]);
+        assert_eq!(seq_pos, 1);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("validation"));
         assert!(text.contains("unclosed [TOOL_CALLS] span"));
@@ -7729,6 +7760,8 @@ mod llama_ar_tool_wire_tests {
         for raw in [
             r#"[TOOL_CALLS][{"name":"ping","id":"short"}]"#,
             r#"[TOOL_CALLS][{"name":"ping"}]"#,
+            // Five characters, ten bytes. The template counts characters.
+            r#"[TOOL_CALLS][{"name":"ping","id":"ééééé"}]"#,
         ] {
             activate_terminal_control("llama-short-id", 44);
             let (mut out, span) = drive("llama-short-id", [raw.as_bytes()], LlamaToolEnd::Stop);
@@ -7746,8 +7779,19 @@ mod llama_ar_tool_wire_tests {
             assert_eq!(out.len(), before);
             assert!(pending.get("calls").is_none());
             let mut tokens = vec![7, 8, 9];
-            llama_reject_tool_span(&mut tokens, 1, &mut out, "llama-short-id", &error);
+            // The cursor has already counted the generated tokens. Rejection
+            // puts it back on the prompt commit, next to the truncated vec.
+            let mut seq_pos = 4;
+            llama_reject_tool_span(
+                &mut tokens,
+                &mut seq_pos,
+                1,
+                &mut out,
+                "llama-short-id",
+                &error,
+            );
             assert_eq!(tokens, vec![7]);
+            assert_eq!(seq_pos, 1);
             let text = String::from_utf8(out).unwrap();
             assert!(text.contains("at least 9 characters"), "{text}");
             assert!(text.contains("\"type\":\"error\""));
@@ -7756,6 +7800,28 @@ mod llama_ar_tool_wire_tests {
             clear_terminal_control();
         }
         set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn llama_release_accepts_nine_characters() {
+        let id = "é".repeat(9);
+        assert_eq!(id.chars().count(), 9);
+        assert!(id.len() > 9);
+        let raw = format!(r#"[TOOL_CALLS][{{"name":"ping","id":"{id}"}}]"#);
+        let (mut out, span) = drive("llama-nine", [raw.as_bytes()], LlamaToolEnd::Stop);
+        assert_eq!(span.calls()[0].id.as_deref(), Some(id.as_str()));
+        let mut pending = serde_json::json!({"type": "done", "finish_reason": "tool_calls"});
+        let terminal = llama_tool_terminal(LlamaToolEnd::Stop, span.calls().len());
+        llama_emit_ready_tool_calls(
+            &mut out,
+            "llama-nine",
+            &mut pending,
+            terminal.finish_reason,
+            span.calls(),
+        )
+        .expect("nine characters");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"type\":\"tool_calls\""), "{text}");
     }
 
     #[test]
