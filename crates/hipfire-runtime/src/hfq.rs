@@ -315,11 +315,14 @@ impl HfqFile {
     /// A mapped copy faults those same pages, the fault window stays at its
     /// initial size, and these positioned reads then hit pages the faults
     /// already brought in. Dropping the guard stops the workers instead of
-    /// waiting for them.
+    /// waiting for them. `finish` records full coverage on this file when
+    /// every indexed byte was read and no worker reported an error.
+    /// Packed-expert zero-copy follows that record.
     #[cfg(unix)]
     pub fn start_cache_warmup(&self) -> CacheWarmerGuard {
+        let covered = std::sync::Arc::clone(&self.cache_warmup_covered);
         if self.evict_page_cache {
-            return CacheWarmerGuard::empty("evict");
+            return CacheWarmerGuard::empty("evict", covered);
         }
         let end = self
             .tensors
@@ -327,7 +330,7 @@ impl HfqFile {
             .map(|t| t.data_offset + t.data_size)
             .unwrap_or(0);
         if end == 0 {
-            return CacheWarmerGuard::empty("empty");
+            return CacheWarmerGuard::empty("empty", covered);
         }
         const CHUNK: usize = 16 << 20;
         // Measured 2026-08-23 on gfx1100 + btrfs md0, time-to-99%-resident for
@@ -391,11 +394,12 @@ impl HfqFile {
             }
         }
         if handles.is_empty() {
-            return CacheWarmerGuard::empty("spawn");
+            return CacheWarmerGuard::empty("spawn", covered);
         }
         CacheWarmerGuard {
             stop,
             progress,
+            covered,
             workers: handles.len(),
             expected_bytes: end as u64,
             started: Some(std::time::Instant::now()),
@@ -411,7 +415,7 @@ impl HfqFile {
     /// The mapping is untouched, so the probe itself does not fault pages
     /// in. A caller that can read the file but cannot write it receives an
     /// all-ones vector, so this must not decide whether a cold read is
-    /// required. Weight warmup does not call it.
+    /// required. Weight warmup and packed-expert upload do not call it.
     #[cfg(unix)]
     pub fn mostly_page_cached(&self) -> bool {
         let end = self
@@ -446,11 +450,9 @@ impl HfqFile {
     }
 
     /// [`Self::mostly_page_cached`] memoized per file instance. The probe
-    /// maps + mincores the whole multi-GB file (~0.4 s on an 18.8 GB model),
-    /// so callers inside a layer sweep must not re-run it per layer — but the
-    /// answer belongs to THIS file: a process-global memo goes stale when the
-    /// daemon swaps models (a warm model A would make a cold model B take the
-    /// zero-copy path and soft-fault serially at ~0.25 GB/s).
+    /// maps and mincores the whole multi-GB file (~0.4 s on an 18.8 GB
+    /// model). A reader without write permission receives an all-ones
+    /// vector, so weight warmup and packed-expert upload do not consult it.
     #[cfg(unix)]
     pub fn mostly_page_cached_memo(&self) -> bool {
         match self.pages_resident_memo.get() {
@@ -480,7 +482,10 @@ impl HfqFile {
     /// Non-unix fallback: nothing to warm.
     #[cfg(not(unix))]
     pub fn start_cache_warmup(&self) -> CacheWarmerGuard {
-        CacheWarmerGuard::empty("unsupported")
+        CacheWarmerGuard::empty(
+            "unsupported",
+            std::sync::Arc::clone(&self.cache_warmup_covered),
+        )
     }
 }
 
@@ -550,6 +555,9 @@ impl std::fmt::Display for CacheWarmupReport {
 pub struct CacheWarmerGuard {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     progress: std::sync::Arc<WarmupProgress>,
+    /// Shared with the [`HfqFile`]. [`Self::finish`] stores `true` only
+    /// after a complete read.
+    covered: std::sync::Arc<std::sync::atomic::AtomicBool>,
     workers: usize,
     expected_bytes: u64,
     started: Option<std::time::Instant>,
@@ -563,10 +571,14 @@ pub struct CacheWarmerGuard {
 }
 
 impl CacheWarmerGuard {
-    fn empty(skipped: &'static str) -> Self {
+    fn empty(
+        skipped: &'static str,
+        covered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         Self {
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             progress: std::sync::Arc::new(WarmupProgress::default()),
+            covered,
             workers: 0,
             expected_bytes: 0,
             started: None,
@@ -581,7 +593,10 @@ impl CacheWarmerGuard {
     ///
     /// A second call returns the same report. Unlike `Drop`, this does not
     /// set the stop flag first. The report's byte count is the coverage;
-    /// threads exiting is not enough on its own.
+    /// threads exiting is not enough on its own. When `bytes_read` equals
+    /// `expected_bytes`, that range is non-empty, and `errors` is zero, this
+    /// stores the file's coverage flag. A skip, a short read, or any worker
+    /// error leaves the flag clear. Dropping the guard does not set it.
     pub fn finish(&mut self) -> CacheWarmupReport {
         if !self.finished {
             self.finished = true;
@@ -590,7 +605,15 @@ impl CacheWarmerGuard {
                 self.elapsed = started.elapsed();
             }
         }
-        self.snapshot()
+        let report = self.snapshot();
+        if report.expected_bytes > 0
+            && report.bytes_read == report.expected_bytes
+            && report.errors == 0
+        {
+            self.covered
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        report
     }
 
     fn snapshot(&self) -> CacheWarmupReport {
@@ -790,6 +813,11 @@ pub struct HfqFile {
     /// process global) so loading a second model in the same daemon probes
     /// its own file instead of inheriting the previous model's answer.
     pages_resident_memo: std::cell::Cell<u8>,
+    /// Set by [`CacheWarmerGuard::finish`] when this process read every
+    /// indexed byte and no worker reported an error. Starts false. A skip,
+    /// a short read, a worker error, or a drop that stops the workers
+    /// leaves it false. Packed-expert zero-copy follows this flag.
+    cache_warmup_covered: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Optional overlay HFQ whose tensors shadow this file's by name (the
     /// REAP load-time splice, SP3). When `Some`, every tensor read method
     /// consults the overlay first and falls back to the base. When `None`
@@ -1550,6 +1578,7 @@ impl HfqFile {
             pread_buf: std::cell::RefCell::new(Vec::new()),
             evict_page_cache: true,
             pages_resident_memo: std::cell::Cell::new(0),
+            cache_warmup_covered: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             overlay: None,
             data_offset: data_abs,
             ple_rows: None,
@@ -1609,6 +1638,16 @@ impl HfqFile {
     /// Whether reads on this file evict pages after reading.
     pub fn evicts_page_cache(&self) -> bool {
         self.evict_page_cache
+    }
+
+    /// Whether this process finished a cache warmup that covered every
+    /// indexed byte with no worker error.
+    ///
+    /// Packed-expert upload borrows the mapping only when this is true.
+    /// The pages are resident because the warmer just read them.
+    pub fn cache_warmup_covered(&self) -> bool {
+        self.cache_warmup_covered
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Release the pread reuse buffer back to the allocator. After a
@@ -4701,6 +4740,7 @@ mod range_upload_release_tests {
         assert_eq!(report.bytes_read, 0);
         assert_eq!(report.errors, 0);
         assert_eq!(report.to_string(), "skipped (evict)");
+        assert!(!hfq.cache_warmup_covered());
     }
 
     /// A file that is already resident is still read. `mincore` is not a
@@ -4720,6 +4760,7 @@ mod range_upload_release_tests {
         write_hfqm_package_mem(&path, 16, "{}", &tensors).unwrap();
         let mut hfq = HfqFile::open(&path).unwrap();
         hfq.set_evict_page_cache(false);
+        assert!(!hfq.cache_warmup_covered());
         let end = hfq
             .tensors()
             .last()
@@ -4730,6 +4771,7 @@ mod range_upload_release_tests {
         assert_eq!(report.errors, 0, "{report}");
         assert_eq!(Some(report.bytes_read), end, "{report}");
         assert_eq!(report.expected_bytes, report.bytes_read, "{report}");
+        assert!(hfq.cache_warmup_covered());
     }
 
     /// A cold file's `finish` returns only after the workers have read the
@@ -4777,6 +4819,7 @@ mod range_upload_release_tests {
         assert_eq!(report.errors, 0, "{report}");
         assert_eq!(Some(report.bytes_read), end, "{report}");
         assert_eq!(warmer.finish().bytes_read, report.bytes_read);
+        assert!(hfq.cache_warmup_covered());
     }
 }
 #[cfg(test)]
