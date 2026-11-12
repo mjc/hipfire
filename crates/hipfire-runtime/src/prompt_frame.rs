@@ -959,14 +959,48 @@ pub fn expand_image_slots(messages: &[Message], replacement: &str) -> Vec<Messag
         .collect()
 }
 
+/// Messages for a llama template that replays `[TOOL_CALLS]`.
+///
+/// [`ToolCall::id`] stays off the generic [`Message`] serialization, so other
+/// architectures do not gain an `id` key. A Mistral v3 template reads that
+/// id on the call and raises when it is missing or not nine characters. This
+/// copies a present id back onto assistant calls and leaves every other field
+/// as [`Message`] serializes it.
+pub fn llama_template_messages(messages: &[Message]) -> Result<Vec<serde_json::Value>, String> {
+    let mut values = Vec::with_capacity(messages.len());
+    for message in messages {
+        let mut value = serde_json::to_value(message).map_err(|err| err.to_string())?;
+        if message.role == Role::Assistant && !message.tool_calls.is_empty() {
+            if let Some(raw_calls) = value
+                .get_mut("tool_calls")
+                .and_then(|calls| calls.as_array_mut())
+            {
+                for (call, raw) in message.tool_calls.iter().zip(raw_calls.iter_mut()) {
+                    let Some(id) = call.id.as_deref().filter(|id| !id.is_empty()) else {
+                        continue;
+                    };
+                    let Some(obj) = raw.as_object_mut() else {
+                        continue;
+                    };
+                    obj.insert("id".to_owned(), serde_json::Value::String(id.to_owned()));
+                }
+            }
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
 /// One assistant-emitted tool call, attached to an assistant `Message`.
 /// `arguments` is a free-form JSON value (typically an object). Templates
 /// that render in XML format (Qwen3.5/3.6's `<function=NAME><parameter=ARG>`
 /// shape) walk this with `arguments | items` under pycompat.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
-    /// Inbound OpenAI `tool_calls[].id`, used to resolve the FOLLOWING tool-result turn's
-    /// function name. Inbound-only for the same no-clobber reason as [`Message::name`].
+    /// Inbound OpenAI `tool_calls[].id`, used to resolve the following tool-result
+    /// turn's function name. Omitted from [`Message`] serialization for the same
+    /// reason as [`Message::name`]: a template that probes the key would change.
+    /// [`llama_template_messages`] puts a present id back for llama replay.
     #[serde(default, skip_serializing)]
     pub id: Option<String>,
     pub name: String,
@@ -3575,6 +3609,71 @@ mod tests {
             out.contains("tool:72F[id=call_1];"),
             "tool response w/ tool_call_id rendered: {out:?}",
         );
+    }
+
+    #[test]
+    fn llama_replay_keeps_a_nine_character_call_id() {
+        let t = make_tokenizer();
+        let template = "{%- for message in messages %}{%- if message.tool_calls %}{%- for tool_call in message.tool_calls %}{%- if tool_call.id is not defined or tool_call.id|length != 9 %}{{ raise_exception('Tool call IDs must be 9 characters in length') }}{%- endif %}{{- '[TOOL_CALLS][{\"id\": \"' + tool_call.id + '\", \"name\": \"' + tool_call.name + '\"}]' }}{%- endfor %}{%- else %}{{- message.content }}{%- endif %}{%- endfor %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: "weather?".to_string(),
+                reasoning_content: None,
+                name: None,
+                rendered_name: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                reasoning_content: None,
+                name: None,
+                rendered_name: None,
+                tool_calls: vec![ToolCall {
+                    id: Some("abc123xyz".to_string()),
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city": "SF"}),
+                    rendered_body: None,
+                }],
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Tool,
+                content: "72F".to_string(),
+                reasoning_content: None,
+                name: None,
+                rendered_name: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some("abc123xyz".to_string()),
+                tool_plan: String::new(),
+            },
+        ];
+        let bare = serde_json::to_value(&messages[1]).unwrap();
+        assert!(bare["tool_calls"][0].get("id").is_none());
+        let omitted = frame
+            .render_messages(&messages, None, None)
+            .expect_err("generic serialization still omits the call id");
+        assert!(omitted.contains("9 characters"));
+        let rendered = frame
+            .render_message_values(llama_template_messages(&messages).unwrap(), None, None)
+            .expect("llama replay includes the call id");
+        assert!(rendered.contains("abc123xyz"));
+        assert!(rendered.contains("get_weather"));
+        assert!(rendered.contains("[TOOL_CALLS]"));
     }
 
     #[test]

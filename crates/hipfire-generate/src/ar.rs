@@ -4321,7 +4321,12 @@ pub fn generate(
                     &synthesized
                 }
             };
-            frame.render_messages(messages_slice, tools, None)
+            if selected_route == GenerationRoute::LlamaAr {
+                hipfire_runtime::prompt_frame::llama_template_messages(messages_slice)
+                    .and_then(|values| frame.render_message_values(values, tools, None))
+            } else {
+                frame.render_messages(messages_slice, tools, None)
+            }
         } else {
             frame.render()
         };
