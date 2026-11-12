@@ -202,6 +202,17 @@ impl LlamaToolSplitter {
     }
 }
 
+/// Content a finished tools-on turn streamed from `text`.
+///
+/// `[TOOL_CALLS]` arrays stay withheld. Text before, between, and after
+/// them is the assistant content a client echoes.
+pub fn visible_llama_tool_prose(text: &str) -> Result<String, LlamaToolSpanError> {
+    let mut splitter = LlamaToolSplitter::new(true);
+    let mut visible = splitter.push(text)?;
+    visible.push_str(&splitter.finish(LlamaToolEnd::Stop)?);
+    Ok(visible)
+}
+
 fn marker_prefix_suffix_len(text: &str) -> usize {
     (1..LLAMA_TOOL_CALLS_MARKER.len())
         .rev()

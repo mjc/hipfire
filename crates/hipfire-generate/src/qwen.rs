@@ -3109,8 +3109,9 @@ fn qwen_accept_tool_argument_replay(
 /// Whether a whole-body tool-turn hit may replay its stored prose. The cache
 /// key of a tool-call turn covers the calls, because clients often echo such
 /// turns with empty content. A client that echoes non-empty content must echo
-/// the producer's own visible prose: the stored body with its reasoning
-/// stripped, up to the first `<tool_call>` or `[TOOL_CALLS]`.
+/// the producer's visible prose. A llama turn streams the text around each
+/// `[TOOL_CALLS]` array. A Qwen turn echoes the text before the first
+/// `<tool_call>`.
 fn qwen_whole_body_prose_matches(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     turn: &hipfire_runtime::prompt_frame::CachedAssistantTurn,
@@ -3124,8 +3125,17 @@ fn qwen_whole_body_prose_matches(
         return false;
     };
     let produced = normalize_asst_turn_for_fingerprint(&tokenizer.decode(&body.token_ids));
-    let prose = visible_prose_before_tool_call(&produced);
+    let prose = visible_replay_prose(&produced);
     prose.trim() == echoed.trim()
+}
+
+fn visible_replay_prose(produced: &str) -> String {
+    if produced.contains("[TOOL_CALLS]") {
+        if let Ok(visible) = hipfire_runtime::llama_tool_span::visible_llama_tool_prose(produced) {
+            return visible;
+        }
+    }
+    visible_prose_before_tool_call(produced).to_owned()
 }
 
 fn visible_prose_before_tool_call(produced: &str) -> &str {
@@ -10618,7 +10628,7 @@ mod qwen_history_chain_tests {
             &tok,
             MISTRAL_TOOL_TEMPLATE,
             &stored,
-            "I'll check. [TOOL_CALLS][{\"id\":\"abc123xyz\"}] CACHEDBODY",
+            "I'll check. [TOOL_CALLS][{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"},\"id\":\"abc123xyz\",\"mark\":\"CACHEDBODY\"}]",
         );
         let hist = tool_history("I'll check. ", "abc123xyz");
         let text = replay(&tok, MISTRAL_TOOL_TEMPLATE, &hist, &mut cache);
@@ -10627,6 +10637,40 @@ mod qwen_history_chain_tests {
             "echoed prose before [TOOL_CALLS] missed the cached body: {text}"
         );
         assert!(text.contains("I'll check."), "prose was dropped: {text}");
+    }
+
+    #[test]
+    fn llama_cached_tool_turn_replays_prose_after_the_call() {
+        let tok = tokenizer();
+        let mut cache = AsstTurnCache::new_from_env();
+        let stored = [weather_call(Some("abc123xyz"))];
+        store_body(
+            &mut cache,
+            &tok,
+            MISTRAL_TOOL_TEMPLATE,
+            &stored,
+            "Before [TOOL_CALLS][{\"name\":\"ping\",\"arguments\":{},\"id\":\"abc123xyz\",\"mark\":\"CACHEDBODY\"}] After",
+        );
+        let hit = replay(
+            &tok,
+            MISTRAL_TOOL_TEMPLATE,
+            &tool_history("Before  After", "abc123xyz"),
+            &mut cache,
+        );
+        assert!(
+            hit.contains("CACHEDBODY"),
+            "prose after [TOOL_CALLS] missed the cached body: {hit}"
+        );
+        let miss = replay(
+            &tok,
+            MISTRAL_TOOL_TEMPLATE,
+            &tool_history("Before  Later", "abc123xyz"),
+            &mut cache,
+        );
+        assert!(
+            !miss.contains("CACHEDBODY"),
+            "edited prose after the call reused the cached body: {miss}"
+        );
     }
 
     #[test]
