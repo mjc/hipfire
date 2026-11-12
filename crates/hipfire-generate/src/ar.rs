@@ -4281,8 +4281,9 @@ pub fn generate(
         };
         // Phase 1 of Jinja-everywhere migration: when the caller supplies
         // either a `tools` array or a `messages` history (or both), route
-        // through `render_messages` so the upstream template's
-        // `{% if tools %}` / multi-turn branches fire. With neither
+        // through `render_history` so the upstream template's
+        // `{% if tools %}` / multi-turn branches fire. A `[TOOL_CALLS]`
+        // template replays assistant calls as `function` plus id. With neither
         // supplied, fall through to the single-turn `render()` convenience,
         // which is byte-identical to the synthesized [system?, user]
         // path that shipped under HIPFIRE_JINJA_CHAT=1 before this change.
@@ -4321,12 +4322,7 @@ pub fn generate(
                     &synthesized
                 }
             };
-            if selected_route == GenerationRoute::LlamaAr {
-                hipfire_runtime::prompt_frame::llama_template_messages(messages_slice)
-                    .and_then(|values| frame.render_message_values(values, tools, None))
-            } else {
-                frame.render_messages(messages_slice, tools, None)
-            }
+            frame.render_history(messages_slice, tools, None)
         } else {
             frame.render()
         };

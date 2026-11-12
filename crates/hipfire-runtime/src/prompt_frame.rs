@@ -962,10 +962,12 @@ pub fn expand_image_slots(messages: &[Message], replacement: &str) -> Vec<Messag
 /// Messages for a llama template that replays `[TOOL_CALLS]`.
 ///
 /// [`ToolCall::id`] stays off the generic [`Message`] serialization, so other
-/// architectures do not gain an `id` key. A Mistral v3 template reads that
-/// id on the call and raises when it is missing or not nine characters. This
-/// copies a present id back onto assistant calls and leaves every other field
-/// as [`Message`] serializes it.
+/// architectures do not gain an `id` key. A Mistral v3 template renders
+/// `tool_call.function|tojson`, drops the closing brace, and appends the last
+/// nine characters of `tool_call.id`. With no `function` key that filter emits
+/// JSON `null`, and the next turn sees `nul` instead of the call. This
+/// replaces each assistant call with `function: {name, arguments}` and copies
+/// a present id onto that object.
 pub fn llama_template_messages(messages: &[Message]) -> Result<Vec<serde_json::Value>, String> {
     let mut values = Vec::with_capacity(messages.len());
     for message in messages {
@@ -976,13 +978,24 @@ pub fn llama_template_messages(messages: &[Message]) -> Result<Vec<serde_json::V
                 .and_then(|calls| calls.as_array_mut())
             {
                 for (call, raw) in message.tool_calls.iter().zip(raw_calls.iter_mut()) {
-                    let Some(id) = call.id.as_deref().filter(|id| !id.is_empty()) else {
-                        continue;
-                    };
-                    let Some(obj) = raw.as_object_mut() else {
-                        continue;
-                    };
-                    obj.insert("id".to_owned(), serde_json::Value::String(id.to_owned()));
+                    let mut projected = serde_json::Map::new();
+                    if let Some(id) = call.id.as_deref().filter(|id| !id.is_empty()) {
+                        projected.insert("id".to_owned(), serde_json::Value::String(id.to_owned()));
+                    }
+                    projected.insert(
+                        "function".to_owned(),
+                        serde_json::json!({
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        }),
+                    );
+                    if let Some(body) = call.rendered_body.as_deref() {
+                        projected.insert(
+                            "rendered_body".to_owned(),
+                            serde_json::Value::String(body.to_owned()),
+                        );
+                    }
+                    *raw = serde_json::Value::Object(projected);
                 }
             }
         }
@@ -1000,7 +1013,7 @@ pub struct ToolCall {
     /// Inbound OpenAI `tool_calls[].id`, used to resolve the following tool-result
     /// turn's function name. Omitted from [`Message`] serialization for the same
     /// reason as [`Message::name`]: a template that probes the key would change.
-    /// [`llama_template_messages`] puts a present id back for llama replay.
+    /// [`llama_template_messages`] puts a present id on the projected call.
     #[serde(default, skip_serializing)]
     pub id: Option<String>,
     pub name: String,
@@ -1389,6 +1402,23 @@ impl<'a> JinjaChatFrame<'a> {
             .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
             .collect();
         self.render_message_values(messages, tools, tool_call_kwargs)
+    }
+
+    /// [`Self::render_messages`], with Mistral `[TOOL_CALLS]` history projected
+    /// through [`llama_template_messages`]. Other templates keep the generic
+    /// [`Message`] shape.
+    pub fn render_history(
+        &self,
+        messages: &[Message],
+        tools: Option<&[serde_json::Value]>,
+        tool_call_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<String, String> {
+        if self.template.contains("[TOOL_CALLS]") {
+            let values = llama_template_messages(messages)?;
+            self.render_message_values(values, tools, tool_call_kwargs)
+        } else {
+            self.render_messages(messages, tools, tool_call_kwargs)
+        }
     }
 
     /// [`Self::render_messages`] over already-serialized messages, for an
@@ -1851,7 +1881,7 @@ pub fn build_cached_history_jinja_with(
 ) -> Result<Vec<u32>, String> {
     let tok = frame.tokenizer;
     // 1. Plain render is the sole fallback; compute it first.
-    let plain_tokens = tok.encode(&frame.render_messages(messages, tools, None)?);
+    let plain_tokens = tok.encode(&frame.render_history(messages, tools, None)?);
     // 2. Walk messages, call lookup at most once per assistant turn, validate.
     let mut cached_hits: Vec<(usize, CachedAssistantTurn)> = Vec::new();
     let mut max_tool_slots: usize = 0;
@@ -2034,7 +2064,7 @@ pub fn build_cached_history_jinja_with(
         }
     }
     // 5. Render substituted, tokenize. Error -> plain.
-    let sub_rendered = match frame.render_messages(&subbed, tools, None) {
+    let sub_rendered = match frame.render_history(&subbed, tools, None) {
         Ok(s) => s,
         Err(_) => return Ok(plain_tokens),
     };
@@ -3611,21 +3641,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn llama_replay_keeps_a_nine_character_call_id() {
-        let t = make_tokenizer();
-        let template = "{%- for message in messages %}{%- if message.tool_calls %}{%- for tool_call in message.tool_calls %}{%- if tool_call.id is not defined or tool_call.id|length != 9 %}{{ raise_exception('Tool call IDs must be 9 characters in length') }}{%- endif %}{{- '[TOOL_CALLS][{\"id\": \"' + tool_call.id + '\", \"name\": \"' + tool_call.name + '\"}]' }}{%- endfor %}{%- else %}{{- message.content }}{%- endif %}{%- endfor %}";
-        let frame = JinjaChatFrame {
-            tokenizer: &t,
-            template,
-            system: None,
-            user: "",
-            enable_thinking: true,
-            bos_token: Some(""),
-            reasoning_strength: None,
-            reasoning_effort: None,
-        };
-        let messages = vec![
+    /// Mistral v3 replays a call as `function|tojson` with the last brace
+    /// replaced by the last nine characters of the id. A missing `function`
+    /// becomes JSON `null`, so the body is `nul`.
+    fn mistral_v3_call_template() -> &'static str {
+        "{%- for message in messages %}{%- if message.tool_calls %}{{- '[TOOL_CALLS] [' }}{%- for tool_call in message.tool_calls %}{%- set out = tool_call.function|tojson %}{{- out[:-1] }}{%- if not tool_call.id is defined or tool_call.id|length < 9 %}{{- raise_exception('Tool call IDs should be alphanumeric strings with length >= 9!') }}{%- endif %}{{- ', \"id\": \"' + tool_call.id[-9:] + '\"}' }}{%- if not loop.last %}{{- ', ' }}{%- endif %}{%- endfor %}{{- ']' }}{%- else %}{{- message.content }}{%- endif %}{%- endfor %}"
+    }
+
+    fn mistral_v3_replay_messages() -> Vec<Message> {
+        vec![
             Message {
                 role: Role::User,
                 content: "weather?".to_string(),
@@ -3661,19 +3685,75 @@ mod tests {
                 tool_call_id: Some("abc123xyz".to_string()),
                 tool_plan: String::new(),
             },
-        ];
+        ]
+    }
+
+    fn assert_mistral_call_body(rendered: &str) {
+        assert!(
+            rendered.contains(
+                r#"[TOOL_CALLS] [{"name": "get_weather", "arguments": {"city": "SF"}, "id": "abc123xyz"}]"#
+            ),
+            "replay dropped the function body: {rendered:?}",
+        );
+        assert!(
+            !rendered.contains("nul"),
+            "missing function serialized as null: {rendered:?}",
+        );
+    }
+
+    #[test]
+    fn llama_replay_keeps_a_nine_character_call_id() {
+        let t = make_tokenizer();
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: mistral_v3_call_template(),
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let messages = mistral_v3_replay_messages();
         let bare = serde_json::to_value(&messages[1]).unwrap();
         assert!(bare["tool_calls"][0].get("id").is_none());
         let omitted = frame
             .render_messages(&messages, None, None)
             .expect_err("generic serialization still omits the call id");
-        assert!(omitted.contains("9 characters"));
+        assert!(
+            omitted.contains("length >= 9"),
+            "generic render should raise on the missing id: {omitted}",
+        );
         let rendered = frame
             .render_message_values(llama_template_messages(&messages).unwrap(), None, None)
-            .expect("llama replay includes the call id");
-        assert!(rendered.contains("abc123xyz"));
-        assert!(rendered.contains("get_weather"));
-        assert!(rendered.contains("[TOOL_CALLS]"));
+            .expect("llama replay includes the call");
+        assert_mistral_call_body(&rendered);
+    }
+
+    #[test]
+    fn llama_replay_cached_history_keeps_the_function_body() {
+        let t = make_tokenizer();
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: mistral_v3_call_template(),
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let messages = mistral_v3_replay_messages();
+        let tokens = build_cached_history_jinja_with(
+            &frame,
+            &messages,
+            None,
+            ToolTurnSplice::WholeBody,
+            |_| None,
+        )
+        .expect("cached history render projects the call");
+        let text = t.decode(&tokens);
+        assert_mistral_call_body(&text);
     }
 
     #[test]
