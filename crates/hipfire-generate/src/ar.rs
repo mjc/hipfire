@@ -6949,24 +6949,26 @@ pub fn generate(
             hipfire_runtime::llama_tool_span::LlamaToolEnd::Length
         };
         if tools_nonempty {
-            // The default filter holds a trailing partial UTF-8 sequence.
-            // Drain it into the splitter only when tools are on, so a held
-            // tail is not dropped and the tools-off path stays byte-identical.
-            let tail = filter.finish();
-            let tail_text = std::str::from_utf8(&tail).unwrap();
-            let closed = tool_span.push(tail_text).and_then(|visible| {
-                llama_emit_through_think(stdout, id, &mut think, &visible);
-                tool_span.finish(tool_end)
-            });
-            match closed {
-                Ok(visible) => {
-                    llama_emit_through_think(stdout, id, &mut think, &visible);
-                }
-                Err(error) => {
-                    m.conversation_tokens.truncate(llama_committed_len);
-                    llama_tool_span_error(stdout, id, &error);
-                    return;
-                }
+            // Drain a held tail into the splitter. A partial codepoint is
+            // dropped, matching the tools-off finish path, so this cannot
+            // panic. The tools-off path still finalizes inside
+            // `vl_finish_think_routing` below.
+            if let Err(error) = llama_finish_tool_text(
+                stdout,
+                id,
+                &mut filter,
+                &mut think,
+                &mut tool_span,
+                tool_end,
+            ) {
+                llama_reject_tool_span(
+                    &mut m.conversation_tokens,
+                    llama_committed_len,
+                    stdout,
+                    id,
+                    &error,
+                );
+                return;
             }
         }
         let tool_terminal = hipfire_runtime::llama_tool_span::llama_tool_terminal(
@@ -7049,16 +7051,14 @@ pub fn generate(
             }
         }
         if tool_terminal.release_calls {
-            // Legacy clients read the event. `stage_terminal_tool_calls`
-            // also embeds `calls` on the done, and only when finish_reason
-            // is tool_calls. The event has to precede commit_ready.
-            stage_terminal_tool_calls(
+            // Legacy clients read the event. The event precedes commit.
+            llama_emit_ready_tool_calls(
+                stdout,
+                id,
                 &mut pending_done,
                 tool_terminal.finish_reason,
                 tool_span.calls(),
             );
-            emit_tool_calls_event(stdout, id, tool_span.calls());
-            let _ = stdout.flush();
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
             ClientTerminalDecision::Commit => {
@@ -7128,6 +7128,51 @@ fn llama_observe_tool_text(
     Ok(())
 }
 
+fn llama_finish_tool_text(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    filter: &mut EosFilter,
+    think: &mut ThinkOutputRouter,
+    tool_span: &mut hipfire_runtime::llama_tool_span::LlamaToolSplitter,
+    tool_end: hipfire_runtime::llama_tool_span::LlamaToolEnd,
+) -> Result<(), hipfire_runtime::llama_tool_span::LlamaToolSpanError> {
+    let tail = filter.finish();
+    // Eos emits an incomplete codepoint as raw bytes. The tools-off finish
+    // path ignores those bytes; panicking here would skip the length terminal.
+    let tail_text = std::str::from_utf8(&tail).unwrap_or("");
+    let visible = tool_span.push(tail_text)?;
+    llama_emit_through_think(stdout, id, think, &visible);
+    let visible = tool_span.finish(tool_end)?;
+    llama_emit_through_think(stdout, id, think, &visible);
+    Ok(())
+}
+
+fn llama_reject_tool_span(
+    conversation_tokens: &mut Vec<u32>,
+    committed_len: usize,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    error: &hipfire_runtime::llama_tool_span::LlamaToolSpanError,
+) {
+    conversation_tokens.truncate(committed_len);
+    llama_tool_span_error(stdout, id, error);
+}
+
+fn llama_emit_ready_tool_calls(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    pending_done: &mut serde_json::Value,
+    finish_reason: &str,
+    calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) {
+    if finish_reason != "tool_calls" {
+        return;
+    }
+    stage_terminal_tool_calls(pending_done, finish_reason, calls);
+    emit_tool_calls_event(stdout, id, calls);
+    let _ = stdout.flush();
+}
+
 fn llama_tool_span_error(
     stdout: &mut impl std::io::Write,
     id: &str,
@@ -7142,6 +7187,128 @@ fn llama_tool_span_error(
         false,
     );
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod llama_ar_tool_wire_tests {
+    use super::{
+        llama_emit_ready_tool_calls, llama_finish_tool_text, llama_observe_tool_text,
+        llama_reject_tool_span,
+    };
+    use hipfire_engine::terminal::{
+        activate_terminal_control, clear_terminal_control, set_active_attempt_id,
+    };
+    use hipfire_runtime::emit_text::ThinkOutputRouter;
+    use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig};
+    use hipfire_runtime::llama_tool_span::{llama_tool_terminal, LlamaToolEnd, LlamaToolSplitter};
+
+    fn drive<'a>(
+        id: &str,
+        chunks: impl IntoIterator<Item = &'a [u8]>,
+        end: LlamaToolEnd,
+    ) -> (Vec<u8>, LlamaToolSplitter) {
+        let mut filter = EosFilter::new(EosFilterConfig::default());
+        let mut think = ThinkOutputRouter::new(false);
+        let mut span = LlamaToolSplitter::new(true);
+        let mut out = Vec::new();
+        for chunk in chunks {
+            llama_observe_tool_text(&mut out, id, &mut filter, &mut think, &mut span, chunk)
+                .unwrap();
+        }
+        llama_finish_tool_text(&mut out, id, &mut filter, &mut think, &mut span, end).unwrap();
+        (out, span)
+    }
+
+    #[test]
+    fn incomplete_utf8_tail_finishes_length_without_panicking() {
+        set_active_attempt_id(41);
+        let (out, span) = drive("llama-utf8", [[0xE4].as_slice()], LlamaToolEnd::Length);
+        let terminal = llama_tool_terminal(LlamaToolEnd::Length, span.calls().len());
+        assert!(span.calls().is_empty());
+        assert_eq!(terminal.finish_reason, "length");
+        assert!(!terminal.release_calls);
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("\"type\":\"token\""));
+        assert!(!text.contains("\"type\":\"done\""));
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn completed_call_emits_prose_then_tool_calls_before_done() {
+        set_active_attempt_id(42);
+        let raw = r#"I'll check. [TOOL_CALLS][{"name":"get_weather","arguments":{"city":"SF"},"id":"abc123xyz"}]"#;
+        let (mut out, span) = drive(
+            "llama-call",
+            [raw[..20].as_bytes(), raw[20..].as_bytes()],
+            LlamaToolEnd::Stop,
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("I'll check."));
+        assert!(!text.contains("[TOOL_CALLS]"));
+        assert!(!text.contains("\"type\":\"done\""));
+        assert!(!text.contains("\"type\":\"tool_calls\""));
+        assert_eq!(span.calls().len(), 1);
+        assert_eq!(span.calls()[0].name, "get_weather");
+        let terminal = llama_tool_terminal(LlamaToolEnd::Stop, span.calls().len());
+        let mut pending_done = serde_json::json!({
+            "type": "done",
+            "finish_reason": terminal.finish_reason,
+        });
+        llama_emit_ready_tool_calls(
+            &mut out,
+            "llama-call",
+            &mut pending_done,
+            terminal.finish_reason,
+            span.calls(),
+        );
+        let text = String::from_utf8(out).unwrap();
+        let tool_at = text
+            .find("\"type\":\"tool_calls\"")
+            .expect("tool_calls event");
+        assert!(text[tool_at..].contains("get_weather"));
+        assert!(!text.contains("\"type\":\"done\""));
+        assert!(pending_done.get("calls").is_some());
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn unclosed_span_errors_and_drops_decode_tokens_without_done() {
+        set_active_attempt_id(43);
+        activate_terminal_control("llama-open", 43);
+        let mut filter = EosFilter::new(EosFilterConfig::default());
+        let mut think = ThinkOutputRouter::new(false);
+        let mut span = LlamaToolSplitter::new(true);
+        let mut out = Vec::new();
+        let open = br#"[TOOL_CALLS][{"name":"get_weather","arguments":{}"#;
+        llama_observe_tool_text(
+            &mut out,
+            "llama-open",
+            &mut filter,
+            &mut think,
+            &mut span,
+            open,
+        )
+        .unwrap();
+        let error = llama_finish_tool_text(
+            &mut out,
+            "llama-open",
+            &mut filter,
+            &mut think,
+            &mut span,
+            LlamaToolEnd::Stop,
+        )
+        .expect_err("open span at eos");
+        let mut tokens = vec![7, 8, 9];
+        llama_reject_tool_span(&mut tokens, 1, &mut out, "llama-open", &error);
+        assert_eq!(tokens, vec![7]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("validation"));
+        assert!(text.contains("unclosed [TOOL_CALLS] span"));
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(!text.contains("\"type\":\"done\""));
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
 }
 
 /// Resolve whether DeepSeek4 spec-decode is requested from the installed
