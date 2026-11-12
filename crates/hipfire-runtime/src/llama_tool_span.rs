@@ -169,6 +169,11 @@ impl LlamaToolSplitter {
     pub fn calls(&self) -> &[ToolCall] {
         &self.calls
     }
+
+    /// True while a `[TOOL_CALLS]` array is open. Those bytes are not prose.
+    pub fn in_body(&self) -> bool {
+        self.phase == Phase::Body
+    }
 }
 
 fn marker_prefix_suffix_len(text: &str) -> usize {

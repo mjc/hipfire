@@ -1058,9 +1058,12 @@ impl GenerationRoute {
     /// from the content stream and stages those calls on a
     /// `finish_reason == "tool_calls"` terminal, emitting the `tool_calls`
     /// event before commit. That is the span the arch-0 Mistral v3 chat
-    /// template writes. `LlamaSpec` is a separate route and stays refused. A
-    /// length cap does not release calls. An unclosed span at eos is a
-    /// validation error and produces no done.
+    /// template writes. A tools request is refused before prefill when Jinja
+    /// chat is off, the load embeds no chat template, that template has no
+    /// `[TOOL_CALLS]` span, or rendering the template fails. The Plain frame
+    /// has nowhere to put the tool definitions. `LlamaSpec` is a separate
+    /// route and stays refused. A length cap does not release calls. An
+    /// unclosed span at eos is a validation error and produces no done.
     pub const fn supports_tools(self) -> bool {
         matches!(
             self,
@@ -2879,6 +2882,29 @@ pub fn generate(
         let _ = stdout.flush();
         return;
     }
+    if tools_nonempty && selected_route == GenerationRoute::LlamaAr {
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
+        if let Some(reason) =
+            llama_tools_unsupported_reason(m.chat_template.as_deref(), jinja_enabled)
+        {
+            crate::dense::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!(
+                    "tools are not supported on producer route {}: {reason}",
+                    selected_route.name()
+                ),
+                "unsupported",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    }
     if !stop.is_empty() && !selected_route.supports_stop() {
         crate::dense::emit_active_attempt_error(
             stdout,
@@ -4308,7 +4334,12 @@ pub fn generate(
                 tokenizer.encode(&rendered)
             }
             Err(e) => {
-                if reasoning_effort.is_some() {
+                // A failed llama-tools render never reached the tool
+                // definitions. Stop before the Plain frame, which cannot
+                // carry them, is used as the prompt.
+                if reasoning_effort.is_some()
+                    || (tools_nonempty && selected_route == GenerationRoute::LlamaAr)
+                {
                     crate::dense::emit_active_attempt_error(
                         stdout,
                         Some(id),
@@ -6812,6 +6843,9 @@ pub fn generate(
         // Disabled when tools are off, so that path never consults it.
         let mut tool_span =
             hipfire_runtime::llama_tool_span::LlamaToolSplitter::new(tools_nonempty);
+        // Text not yet classified. A partial `<think>`, `</think>`, or
+        // `[TOOL_CALLS]` prefix stays here until the next chunk resolves it.
+        let mut tool_held = String::new();
 
         let mut hit_stop = false;
         for _ in 0..max_tokens {
@@ -6849,6 +6883,7 @@ pub fn generate(
                         &mut filter,
                         &mut think,
                         &mut tool_span,
+                        &mut tool_held,
                         &stream_bytes[fed..],
                     ) {
                         // Drop decode tokens so conversation stays aligned
@@ -6959,6 +6994,7 @@ pub fn generate(
                 &mut filter,
                 &mut think,
                 &mut tool_span,
+                &mut tool_held,
                 tool_end,
             ) {
                 llama_reject_tool_span(
@@ -7091,6 +7127,39 @@ pub fn generate(
     }
 }
 
+const LLAMA_THINK_OPEN: &str = "<think>";
+const LLAMA_THINK_CLOSE: &str = "</think>";
+const LLAMA_TOOL_MARKER: &str = "[TOOL_CALLS]";
+
+/// Why a llama tools request cannot be framed. `None` means the embedded
+/// template can declare the `[TOOL_CALLS]` span.
+fn llama_tools_unsupported_reason(
+    chat_template: Option<&str>,
+    jinja_enabled: bool,
+) -> Option<&'static str> {
+    if !jinja_enabled {
+        return Some(
+            "HIPFIRE_JINJA_CHAT=0 disables the chat template that declares tools to the model",
+        );
+    }
+    match chat_template {
+        None => Some("this model embeds no chat template, so it cannot declare tools"),
+        Some(template) if !template.contains(LLAMA_TOOL_MARKER) => {
+            Some("this model's chat template has no [TOOL_CALLS] tool-call format")
+        }
+        Some(_) => None,
+    }
+}
+
+fn llama_emit_routed(stdout: &mut impl std::io::Write, id: &str, routed: &[ThinkRouteEvent]) {
+    for event in routed {
+        match event {
+            ThinkRouteEvent::Reasoning(text) => emit_reasoning_token(stdout, id, text),
+            ThinkRouteEvent::Content(text) => emit_visible_token(stdout, id, text),
+        }
+    }
+}
+
 fn llama_emit_through_think(
     stdout: &mut impl std::io::Write,
     id: &str,
@@ -7102,12 +7171,119 @@ fn llama_emit_through_think(
     }
     let mut routed = Vec::new();
     think.push_into(text, &mut routed);
-    for event in routed {
-        match event {
-            ThinkRouteEvent::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-            ThinkRouteEvent::Content(text) => emit_visible_token(stdout, id, &text),
+    llama_emit_routed(stdout, id, &routed);
+}
+
+/// Longest suffix of `text` that is a proper prefix of `marker`.
+fn llama_marker_prefix_suffix(text: &str, marker: &str) -> usize {
+    let max = marker.len().saturating_sub(1).min(text.len());
+    for len in (1..=max).rev() {
+        let start = text.len() - len;
+        if text.is_char_boundary(start) && marker.starts_with(&text[start..]) {
+            return len;
         }
     }
+    0
+}
+
+fn llama_earliest_think_marker(text: &str) -> Option<(usize, usize)> {
+    let open = text
+        .find(LLAMA_THINK_OPEN)
+        .map(|at| (at, LLAMA_THINK_OPEN.len()));
+    let close = text
+        .find(LLAMA_THINK_CLOSE)
+        .map(|at| (at, LLAMA_THINK_CLOSE.len()));
+    match (open, close) {
+        (Some(open_at), Some(close_at)) if close_at.0 < open_at.0 => Some(close_at),
+        (Some(open_at), Some(_)) => Some(open_at),
+        (Some(open_at), None) => Some(open_at),
+        (None, Some(close_at)) => Some(close_at),
+        (None, None) => None,
+    }
+}
+
+/// Classify `held`. A new `[TOOL_CALLS]` span starts only on the content
+/// channel. Bytes inside an open array are not scanned for think markers,
+/// so a `</think>` in an argument cannot close reasoning or split the call.
+fn llama_drain_tool_text(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    think: &mut ThinkOutputRouter,
+    tool_span: &mut hipfire_runtime::llama_tool_span::LlamaToolSplitter,
+    held: &mut String,
+    finish: bool,
+) -> Result<(), hipfire_runtime::llama_tool_span::LlamaToolSpanError> {
+    loop {
+        if held.is_empty() {
+            break;
+        }
+        if tool_span.in_body() {
+            let visible = tool_span.push(held)?;
+            held.clear();
+            if visible.is_empty() {
+                break;
+            }
+            held.push_str(&visible);
+            continue;
+        }
+        if think.in_think() {
+            if let Some((at, len)) = llama_earliest_think_marker(held) {
+                let through = at + len;
+                llama_emit_through_think(stdout, id, think, &held[..through]);
+                held.drain(..through);
+                continue;
+            }
+            let hold = if finish {
+                0
+            } else {
+                llama_marker_prefix_suffix(held, LLAMA_THINK_OPEN)
+                    .max(llama_marker_prefix_suffix(held, LLAMA_THINK_CLOSE))
+            };
+            let emit_len = held.len() - hold;
+            if emit_len > 0 {
+                llama_emit_through_think(stdout, id, think, &held[..emit_len]);
+                held.drain(..emit_len);
+            }
+            break;
+        }
+        let think_at = llama_earliest_think_marker(held);
+        if let Some(tool) = held.find(LLAMA_TOOL_MARKER) {
+            let think_before = think_at.is_some_and(|(at, _)| at < tool);
+            if !think_before {
+                if tool > 0 {
+                    llama_emit_through_think(stdout, id, think, &held[..tool]);
+                    held.drain(..tool);
+                }
+                let visible = tool_span.push(held)?;
+                held.clear();
+                if !visible.is_empty() {
+                    held.push_str(&visible);
+                    continue;
+                }
+                break;
+            }
+        }
+        if let Some((at, len)) = think_at {
+            let through = at + len;
+            llama_emit_through_think(stdout, id, think, &held[..through]);
+            held.drain(..through);
+            continue;
+        }
+        let hold = if finish {
+            0
+        } else {
+            llama_marker_prefix_suffix(held, LLAMA_THINK_OPEN)
+                .max(llama_marker_prefix_suffix(held, LLAMA_THINK_CLOSE))
+                .max(llama_marker_prefix_suffix(held, LLAMA_TOOL_MARKER))
+        };
+        let emit_len = held.len() - hold;
+        if emit_len > 0 {
+            llama_emit_through_think(stdout, id, think, &held[..emit_len]);
+            held.drain(..emit_len);
+        }
+        break;
+    }
+    Ok(())
 }
 
 fn llama_observe_tool_text(
@@ -7116,16 +7292,19 @@ fn llama_observe_tool_text(
     filter: &mut EosFilter,
     think: &mut ThinkOutputRouter,
     tool_span: &mut hipfire_runtime::llama_tool_span::LlamaToolSplitter,
+    held: &mut String,
     new_bytes: &[u8],
 ) -> Result<(), hipfire_runtime::llama_tool_span::LlamaToolSpanError> {
     let text_bytes = match filter.observe(new_bytes) {
         FilterAction::Emit(bytes) | FilterAction::EmitAndStop(bytes) => bytes,
         FilterAction::Hold | FilterAction::Stop => return Ok(()),
     };
+    // The filter holds an incomplete codepoint until it completes. A
+    // byte-fallback token that never completes is dropped, same as mid-stream
+    // tools-off routing.
     let text = std::str::from_utf8(&text_bytes).unwrap_or("");
-    let visible = tool_span.push(text)?;
-    llama_emit_through_think(stdout, id, think, &visible);
-    Ok(())
+    held.push_str(text);
+    llama_drain_tool_text(stdout, id, think, tool_span, held, false)
 }
 
 fn llama_finish_tool_text(
@@ -7134,16 +7313,23 @@ fn llama_finish_tool_text(
     filter: &mut EosFilter,
     think: &mut ThinkOutputRouter,
     tool_span: &mut hipfire_runtime::llama_tool_span::LlamaToolSplitter,
+    held: &mut String,
     tool_end: hipfire_runtime::llama_tool_span::LlamaToolEnd,
 ) -> Result<(), hipfire_runtime::llama_tool_span::LlamaToolSpanError> {
     let tail = filter.finish();
     // Eos emits an incomplete codepoint as raw bytes. The tools-off finish
     // path ignores those bytes; panicking here would skip the length terminal.
     let tail_text = std::str::from_utf8(&tail).unwrap_or("");
-    let visible = tool_span.push(tail_text)?;
-    llama_emit_through_think(stdout, id, think, &visible);
+    held.push_str(tail_text);
+    llama_drain_tool_text(stdout, id, think, tool_span, held, true)?;
     let visible = tool_span.finish(tool_end)?;
-    llama_emit_through_think(stdout, id, think, &visible);
+    if !visible.is_empty() {
+        held.push_str(&visible);
+        llama_drain_tool_text(stdout, id, think, tool_span, held, true)?;
+    }
+    let mut routed = Vec::new();
+    think.finish_into(&mut routed);
+    llama_emit_routed(stdout, id, &routed);
     Ok(())
 }
 
@@ -7202,25 +7388,53 @@ mod llama_ar_tool_wire_tests {
     use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig};
     use hipfire_runtime::llama_tool_span::{llama_tool_terminal, LlamaToolEnd, LlamaToolSplitter};
 
-    fn drive<'a>(
+    fn drive_from<'a>(
+        started_in_think: bool,
         id: &str,
         chunks: impl IntoIterator<Item = &'a [u8]>,
         end: LlamaToolEnd,
     ) -> (Vec<u8>, LlamaToolSplitter) {
         let mut filter = EosFilter::new(EosFilterConfig::default());
-        let mut think = ThinkOutputRouter::new(false);
+        let mut think = ThinkOutputRouter::new(started_in_think);
         let mut span = LlamaToolSplitter::new(true);
+        let mut held = String::new();
         let mut out = Vec::new();
         for chunk in chunks {
-            llama_observe_tool_text(&mut out, id, &mut filter, &mut think, &mut span, chunk)
-                .unwrap();
+            llama_observe_tool_text(
+                &mut out,
+                id,
+                &mut filter,
+                &mut think,
+                &mut span,
+                &mut held,
+                chunk,
+            )
+            .unwrap();
         }
-        llama_finish_tool_text(&mut out, id, &mut filter, &mut think, &mut span, end).unwrap();
+        llama_finish_tool_text(
+            &mut out,
+            id,
+            &mut filter,
+            &mut think,
+            &mut span,
+            &mut held,
+            end,
+        )
+        .unwrap();
         (out, span)
+    }
+
+    fn drive<'a>(
+        id: &str,
+        chunks: impl IntoIterator<Item = &'a [u8]>,
+        end: LlamaToolEnd,
+    ) -> (Vec<u8>, LlamaToolSplitter) {
+        drive_from(false, id, chunks, end)
     }
 
     #[test]
     fn incomplete_utf8_tail_finishes_length_without_panicking() {
+        let _guard = super::generation_test_lock();
         set_active_attempt_id(41);
         let (out, span) = drive("llama-utf8", [[0xE4].as_slice()], LlamaToolEnd::Length);
         let terminal = llama_tool_terminal(LlamaToolEnd::Length, span.calls().len());
@@ -7235,6 +7449,7 @@ mod llama_ar_tool_wire_tests {
 
     #[test]
     fn completed_call_emits_prose_then_tool_calls_before_done() {
+        let _guard = super::generation_test_lock();
         set_active_attempt_id(42);
         let raw = r#"I'll check. [TOOL_CALLS][{"name":"get_weather","arguments":{"city":"SF"},"id":"abc123xyz"}]"#;
         let (mut out, span) = drive(
@@ -7273,11 +7488,13 @@ mod llama_ar_tool_wire_tests {
 
     #[test]
     fn unclosed_span_errors_and_drops_decode_tokens_without_done() {
+        let _guard = super::generation_test_lock();
         set_active_attempt_id(43);
         activate_terminal_control("llama-open", 43);
         let mut filter = EosFilter::new(EosFilterConfig::default());
         let mut think = ThinkOutputRouter::new(false);
         let mut span = LlamaToolSplitter::new(true);
+        let mut held = String::new();
         let mut out = Vec::new();
         let open = br#"[TOOL_CALLS][{"name":"get_weather","arguments":{}"#;
         llama_observe_tool_text(
@@ -7286,6 +7503,7 @@ mod llama_ar_tool_wire_tests {
             &mut filter,
             &mut think,
             &mut span,
+            &mut held,
             open,
         )
         .unwrap();
@@ -7295,6 +7513,7 @@ mod llama_ar_tool_wire_tests {
             &mut filter,
             &mut think,
             &mut span,
+            &mut held,
             LlamaToolEnd::Stop,
         )
         .expect_err("open span at eos");
@@ -7308,6 +7527,57 @@ mod llama_ar_tool_wire_tests {
         assert!(!text.contains("\"type\":\"done\""));
         clear_terminal_control();
         set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn tool_call_inside_think_stays_reasoning() {
+        let raw = r#"<think>[TOOL_CALLS][{"name":"ping"}]</think>No action."#;
+        let (out, span) = drive(
+            "llama-think",
+            [raw[..12].as_bytes(), raw[12..].as_bytes()],
+            LlamaToolEnd::Stop,
+        );
+        assert!(span.calls().is_empty());
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"type\":\"reasoning\""));
+        assert!(text.contains("ping"));
+        assert!(text.contains("No action."));
+        assert!(!text.contains("\"type\":\"tool_calls\""));
+    }
+
+    #[test]
+    fn call_after_think_is_released_and_a_closer_inside_the_body_is_opaque() {
+        let (out, span) = drive_from(
+            true,
+            "llama-after-think",
+            [br#"[TOOL_CALLS][{"name":"ping"}]</think>[TOOL_CALLS][{"name":"get_weather","arguments":{"note":"</think>"}}]"#.as_slice()],
+            LlamaToolEnd::Stop,
+        );
+        assert_eq!(span.calls().len(), 1);
+        assert_eq!(span.calls()[0].name, "get_weather");
+        assert_eq!(span.calls()[0].arguments["note"], "</think>");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"type\":\"reasoning\""));
+        assert!(text.contains("ping"));
+        assert!(!text.contains("get_weather"));
+        assert!(!text.contains("\"type\":\"token\""));
+    }
+
+    #[test]
+    fn llama_tools_need_a_template_that_declares_the_span() {
+        let template = "tools: {{ tools }} [TOOL_CALLS]";
+        assert!(super::llama_tools_unsupported_reason(Some(template), true).is_none());
+        assert!(super::llama_tools_unsupported_reason(Some(template), false)
+            .unwrap()
+            .contains("HIPFIRE_JINJA_CHAT=0"));
+        assert!(super::llama_tools_unsupported_reason(None, true)
+            .unwrap()
+            .contains("no chat template"));
+        assert!(
+            super::llama_tools_unsupported_reason(Some("{{ bos_token }}"), true)
+                .unwrap()
+                .contains("[TOOL_CALLS]")
+        );
     }
 }
 
