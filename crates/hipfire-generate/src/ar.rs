@@ -1058,9 +1058,11 @@ impl GenerationRoute {
     /// from the content stream and stages those calls on a
     /// `finish_reason == "tool_calls"` terminal, emitting the `tool_calls`
     /// event before commit. That is the span the arch-0 Mistral v3 chat
-    /// template writes. A released call id is at least 9 characters, which is
-    /// what that template requires on the next turn. A shorter or missing id
-    /// is a validation error and produces no done. A tools request is refused
+    /// template writes. A released call id is at least 9 characters. The
+    /// template copies the last nine into a JSON string, so a quote,
+    /// backslash, or control character in that suffix is a validation error.
+    /// A shorter or missing id is a validation error and produces no done. A
+    /// tools request is refused
     /// before prefill when Jinja chat is off, the load embeds no chat
     /// template, that template has no `[TOOL_CALLS]` span, or rendering the
     /// template fails. The Plain frame has nowhere to put the tool
@@ -7415,22 +7417,40 @@ fn llama_reject_tool_span(
 }
 
 /// The Mistral template's `|length` counts characters. A byte length of 9
-/// can still be fewer than 9 characters.
+/// can still be fewer than 9 characters. The same template then copies the
+/// last nine characters into a JSON string and does not escape them.
 fn llama_replay_id_error(
     calls: &[hipfire_runtime::prompt_frame::ToolCall],
 ) -> Result<(), hipfire_runtime::llama_tool_span::LlamaToolSpanError> {
-    if calls
-        .iter()
-        .any(|call| call.id.as_deref().map(|id| id.chars().count()).unwrap_or(0) < 9)
-    {
-        Err(
-            hipfire_runtime::llama_tool_span::LlamaToolSpanError::Malformed(
-                "tool call id must be at least 9 characters",
-            ),
-        )
-    } else {
-        Ok(())
+    for call in calls {
+        let Some(id) = call.id.as_deref() else {
+            return Err(
+                hipfire_runtime::llama_tool_span::LlamaToolSpanError::Malformed(
+                    "tool call id must be at least 9 characters",
+                ),
+            );
+        };
+        let count = id.chars().count();
+        if count < 9 {
+            return Err(
+                hipfire_runtime::llama_tool_span::LlamaToolSpanError::Malformed(
+                    "tool call id must be at least 9 characters",
+                ),
+            );
+        }
+        let breaks_replay = id
+            .chars()
+            .skip(count - 9)
+            .any(|c| c == '"' || c == '\\' || c.is_control());
+        if breaks_replay {
+            return Err(
+                hipfire_runtime::llama_tool_span::LlamaToolSpanError::Malformed(
+                    "tool call id would break the replayed call",
+                ),
+            );
+        }
     }
+    Ok(())
 }
 
 fn llama_emit_ready_tool_calls(
@@ -7822,6 +7842,78 @@ mod llama_ar_tool_wire_tests {
         .expect("nine characters");
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\"type\":\"tool_calls\""), "{text}");
+    }
+
+    #[test]
+    fn llama_release_refuses_a_replay_breaking_id() {
+        let _guard = super::generation_test_lock();
+        set_active_attempt_id(45);
+        // The template copies the last nine characters into a JSON string.
+        let quote = "abcd\"fghi";
+        let slash = "abcd\\fghi";
+        let newline = "abcd\nfghi";
+        let suffix_quote = format!("abcdefghi\"");
+        for id in [quote, slash, newline, suffix_quote.as_str()] {
+            assert!(id.chars().count() >= 9, "{id:?}");
+            let raw = format!(
+                "[TOOL_CALLS]{}",
+                serde_json::json!([{"name": "ping", "id": id}])
+            );
+            activate_terminal_control("llama-break-id", 45);
+            let (mut out, span) = drive("llama-break-id", [raw.as_bytes()], LlamaToolEnd::Stop);
+            assert_eq!(span.calls()[0].id.as_deref(), Some(id));
+            let mut pending = serde_json::json!({"type": "done", "finish_reason": "tool_calls"});
+            let before = out.len();
+            let error = llama_emit_ready_tool_calls(
+                &mut out,
+                "llama-break-id",
+                &mut pending,
+                "tool_calls",
+                span.calls(),
+            )
+            .expect_err("replay-breaking id");
+            assert_eq!(out.len(), before);
+            assert!(pending.get("calls").is_none());
+            let text_before = String::from_utf8(out.clone()).unwrap();
+            assert!(!text_before.contains("\"type\":\"tool_calls\""));
+            let mut tokens = vec![7, 8, 9];
+            let mut seq_pos = 4;
+            llama_reject_tool_span(
+                &mut tokens,
+                &mut seq_pos,
+                1,
+                &mut out,
+                "llama-break-id",
+                &error,
+            );
+            assert_eq!(tokens, vec![7]);
+            assert_eq!(seq_pos, 1);
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("break the replayed call"), "{text}");
+            assert!(text.contains("\"type\":\"error\""));
+            assert!(!text.contains("\"type\":\"tool_calls\""));
+            assert!(!text.contains("\"type\":\"done\""));
+            clear_terminal_control();
+        }
+        // A quote before the spliced suffix never reaches the template.
+        let kept = format!("\"{}", "abcdefghi");
+        assert_eq!(kept.chars().count(), 10);
+        let raw = format!(
+            "[TOOL_CALLS]{}",
+            serde_json::json!([{"name": "ping", "id": kept}])
+        );
+        let (mut out, span) = drive("llama-break-id", [raw.as_bytes()], LlamaToolEnd::Stop);
+        assert_eq!(span.calls()[0].id.as_deref(), Some(kept.as_str()));
+        let mut pending = serde_json::json!({"type": "done", "finish_reason": "tool_calls"});
+        llama_emit_ready_tool_calls(
+            &mut out,
+            "llama-break-id",
+            &mut pending,
+            "tool_calls",
+            span.calls(),
+        )
+        .expect("quote outside the spliced suffix");
+        set_active_attempt_id(0);
     }
 
     #[test]
