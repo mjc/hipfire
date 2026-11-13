@@ -1060,7 +1060,7 @@ impl GenerationRoute {
     /// event before commit. That is the span the arch-0 Mistral v3 chat
     /// template writes. A released call id is at least 9 characters. The
     /// template copies the last nine into a JSON string, so a quote,
-    /// backslash, or control character in that suffix is a validation error.
+    /// backslash, or U+0000..=U+001F in that suffix is a validation error.
     /// A shorter or missing id is a validation error and produces no done. A
     /// tools request is refused
     /// before prefill when Jinja chat is off, the load embeds no chat
@@ -7418,7 +7418,9 @@ fn llama_reject_tool_span(
 
 /// The Mistral template's `|length` counts characters. A byte length of 9
 /// can still be fewer than 9 characters. The same template then copies the
-/// last nine characters into a JSON string and does not escape them.
+/// last nine characters into a JSON string and does not escape them. That
+/// splice is invalid for `"`, `\`, and U+0000..=U+001F. U+007F and the C1
+/// controls remain valid inside the string.
 fn llama_replay_id_error(
     calls: &[hipfire_runtime::prompt_frame::ToolCall],
 ) -> Result<(), hipfire_runtime::llama_tool_span::LlamaToolSpanError> {
@@ -7441,7 +7443,7 @@ fn llama_replay_id_error(
         let breaks_replay = id
             .chars()
             .skip(count - 9)
-            .any(|c| c == '"' || c == '\\' || c.is_control());
+            .any(|c| c == '"' || c == '\\' || ('\0'..='\u{1F}').contains(&c));
         if breaks_replay {
             return Err(
                 hipfire_runtime::llama_tool_span::LlamaToolSpanError::Malformed(
@@ -7913,6 +7915,28 @@ mod llama_ar_tool_wire_tests {
             span.calls(),
         )
         .expect("quote outside the spliced suffix");
+        // JSON allows U+007F and U+009F unescaped. The template copies them through.
+        for id in [
+            format!("abcdefgh{}", '\u{7f}'),
+            format!("abcdefgh{}", '\u{9f}'),
+        ] {
+            assert_eq!(id.chars().count(), 9, "{id:?}");
+            let raw = format!(
+                "[TOOL_CALLS]{}",
+                serde_json::json!([{"name": "ping", "id": id}])
+            );
+            let (mut out, span) = drive("llama-break-id", [raw.as_bytes()], LlamaToolEnd::Stop);
+            assert_eq!(span.calls()[0].id.as_deref(), Some(id.as_str()));
+            let mut pending = serde_json::json!({"type": "done", "finish_reason": "tool_calls"});
+            llama_emit_ready_tool_calls(
+                &mut out,
+                "llama-break-id",
+                &mut pending,
+                "tool_calls",
+                span.calls(),
+            )
+            .expect("json allows this character");
+        }
         set_active_attempt_id(0);
     }
 
