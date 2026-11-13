@@ -372,6 +372,12 @@ const SAFE_ROUTES: &[GenerationRoute] = &[
     // Arch 19 with the shared DFlash2 drafter: the same router over committed
     // tokens (`Qwen35Emit` via the Raon carrier, grammar off).
     GenerationRoute::RaonSpec,
+    // Arch 0 text on `llama_ar`. Legacy wire: `LlamaCarrier` keeps
+    // `semantic_contract_version: None`, so the decode path emits a
+    // `tool_calls` event and stages calls on `finish_reason=tool_calls`.
+    // The arch-0 Mistral v3 template's model span is `[TOOL_CALLS]` plus a
+    // JSON array of `{name, arguments, id?}`. `LlamaSpec` stays refused.
+    GenerationRoute::LlamaAr,
 ];
 
 /// Pure gate model mirroring generate()'s tools preflight:
@@ -1187,7 +1193,7 @@ fn qwen4_native_mtp_with_ngram_flag_remains_the_native_route() {
 }
 
 #[test]
-fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_maple_ar_and_gemma4_ar(
+fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_maple_ar_gemma4_ar_and_llama_ar(
 ) {
     let mut from_all: Vec<GenerationRoute> = GenerationRoute::ALL
         .iter()
@@ -1198,7 +1204,7 @@ fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_
     let mut expected = SAFE_ROUTES.to_vec();
     expected.sort_by_key(|r| r.name());
     assert_eq!(from_all, expected);
-    assert_eq!(from_all.len(), 13);
+    assert_eq!(from_all.len(), 14);
     // Negative: every other ALL member is denied for tools.
     for &r in GenerationRoute::ALL {
         if !SAFE_ROUTES.contains(&r) {
