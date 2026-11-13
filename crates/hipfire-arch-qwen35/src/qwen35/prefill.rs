@@ -4246,6 +4246,9 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // refuses V2 everywhere; only this qwen35 caller admits V2. Lockstep with
     // the HasWmma predicate on GemmMq*G256V2* keys and with
     // gemm_mq*g256v2's has_wmma() guard.
+    // MQ4G256V2 on exact gfx1010 is separate: the fused wrappers call
+    // `gemm_mq4g256v2`, which uses the scalar x-batch GEMV. The gfx11
+    // kill switch does not apply. Other V2 widths stay refused there.
     // MQ4CG256 (qt45) remains gfx12-only until its gfx11 sibling lands.
     let mqv2_with_wmma = llama::mqv2_wmma_batchable(
         dt,
@@ -4254,6 +4257,8 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
             .as_deref(),
         arch,
     );
+    let mq4v2_gfx1010_xbatch = dt == DType::MQ4G256V2
+        && rdna_compute::arch_caps::arch_admits_mq4g256v2_xbatch_prefill(arch);
     let mq_other_gfx12 = matches!(dt, DType::MQ4CG256) && matches!(arch, "gfx1200" | "gfx1201");
 
     // BF16 calibration teacher (qt=16) — native BF16 GEMM on gfx942 (CDNA3
@@ -4271,6 +4276,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || fp4_with_wmma
         || e8_with_wmma
         || mqv2_with_wmma
+        || mq4v2_gfx1010_xbatch
         || mq_other_gfx12
         || bf16_with_gfx942
 }
@@ -8060,8 +8066,11 @@ mod tests {
                 "MQ4G256V2 should batch on {arch}"
             );
         }
-        // non-WMMA must still fall back
-        for arch in ["gfx1010", "gfx1030", "gfx942", "gfx906"] {
+        assert!(
+            is_batchable_la(DType::MQ4G256V2, "gfx1010"),
+            "MQ4G256V2 uses the scalar x-batch path on gfx1010"
+        );
+        for arch in ["gfx1030", "gfx942", "gfx906"] {
             assert!(
                 !is_batchable_la(DType::MQ4G256V2, arch),
                 "MQ4G256V2 must fall back on {arch}"
@@ -8251,9 +8260,11 @@ mod tests {
                 "llama must refuse {dt:?} on gfx1201"
             );
             for arch in ["gfx1030", "gfx1010"] {
-                assert!(
-                    !is_batchable_la(dt, arch),
-                    "qwen35 must refuse {dt:?} on {arch}"
+                let qwen_admits = dt == DType::MQ4G256V2 && arch == "gfx1010";
+                assert_eq!(
+                    is_batchable_la(dt, arch),
+                    qwen_admits,
+                    "qwen35 MQ4G256V2 on gfx1010 is the x-batch exception; {dt:?} on {arch}"
                 );
                 assert!(
                     !llama::is_batchable_la(dt, arch),
@@ -8264,6 +8275,9 @@ mod tests {
         // Absolute pins so the test also fails if the shared rule itself
         // regresses, not just on caller drift.
         assert!(is_batchable_la(DType::MQ4G256V2, "gfx1201"));
+        assert!(is_batchable_la(DType::MQ4G256V2, "gfx1010"));
+        assert!(!is_batchable_la(DType::MQ6G256V2, "gfx1010"));
+        assert!(!llama::is_batchable_la(DType::MQ4G256V2, "gfx1010"));
         assert!(!is_batchable_la(DType::MQ4G256V2, "gfx1030"));
         assert!(!is_batchable_la(DType::MQ4CG256, "gfx1100"));
         assert!(!llama::is_batchable_la(DType::MQ4G256V2, "gfx1201"));

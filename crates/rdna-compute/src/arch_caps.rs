@@ -99,6 +99,12 @@ pub fn process_gpu_arch() -> Option<&'static str> {
     PROCESS_GPU_ARCH.get().map(|s| s.as_str())
 }
 
+/// Exact gfx1010. MQ4G256V2 plain and residual batched prefill there uses
+/// the scalar x-batch GEMV. Other gfx10 parts stay on the per-token path.
+pub fn arch_admits_mq4g256v2_xbatch_prefill(arch: &str) -> bool {
+    arch == "gfx1010"
+}
+
 impl ArchCaps {
     pub fn new(arch: &str, flags: std::sync::Arc<FeatureFlags>) -> Self {
         // Atoms
@@ -277,6 +283,9 @@ impl ArchCaps {
     }
     pub fn is_gfx1010(&self) -> bool {
         self.is_gfx1010
+    }
+    pub fn admits_mq4g256v2_xbatch_prefill(&self) -> bool {
+        arch_admits_mq4g256v2_xbatch_prefill(&self.arch)
     }
     pub fn is_gfx1011(&self) -> bool {
         self.is_gfx1011

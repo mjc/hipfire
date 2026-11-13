@@ -41648,6 +41648,19 @@ impl Gpu {
                 alpha_m, k, batch_size,
             );
         }
+        if self.arch_caps.admits_mq4g256v2_xbatch_prefill() {
+            return self.gemm_mq4g256v2_projections(
+                &[
+                    (a_qkv, y_qkv, qkv_m),
+                    (a_z, y_z, z_m),
+                    (a_beta, y_beta, beta_m),
+                    (a_alpha, y_alpha, alpha_m),
+                ],
+                x,
+                k,
+                batch_size,
+            );
+        }
         Err(hip_bridge::HipError::new(
             0,
             "gemm_qkvza_hfq4g256_mq4v2: gfx1201 or gfx11 wmma required",
@@ -41689,6 +41702,14 @@ impl Gpu {
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
             );
         }
+        if self.arch_caps.admits_mq4g256v2_xbatch_prefill() {
+            return self.gemm_mq4g256v2_projections(
+                &[(a_q, y_q, q_m), (a_k, y_k, k_m), (a_v, y_v, v_m)],
+                x,
+                k,
+                batch_size,
+            );
+        }
         Err(hip_bridge::HipError::new(
             0,
             "gemm_qkv_hfq4g256_mq4v2: gfx1201 or gfx11 wmma required",
@@ -41727,10 +41748,34 @@ impl Gpu {
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             );
         }
+        if self.arch_caps.admits_mq4g256v2_xbatch_prefill() {
+            return self.gemm_mq4g256v2_projections(
+                &[(a_gate, y_gate, gate_m), (a_up, y_up, up_m)],
+                x,
+                k,
+                batch_size,
+            );
+        }
         Err(hip_bridge::HipError::new(
             0,
             "gemm_gate_up_hfq4g256_mq4v2: gfx1201 or gfx11 wmma required",
         ))
+    }
+
+    /// Plain `Y = W·X` for each projection through [`Self::gemm_mq4g256v2`].
+    /// On gfx1010 that is the scalar x-batch GEMV, one launch group per
+    /// projection. Callers admit only that arch.
+    fn gemm_mq4g256v2_projections(
+        &mut self,
+        parts: &[(&GpuTensor, &GpuTensor, usize)],
+        x: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        for (weight, output, rows) in parts {
+            self.gemm_mq4g256v2(weight, x, output, *rows, k, batch_size)?;
+        }
+        Ok(())
     }
 
     pub fn gemm_hfq4g256_residual_mq4v2(
@@ -54677,6 +54722,70 @@ mod tests {
                 "residual batch row {}, output {}",
                 index / M,
                 index % M
+            );
+        }
+
+        // The fused wrappers reach this plain x-batch path only on gfx1010.
+        // A WMMA host sends them through WMMA, so the comparison stays here.
+        if gpu.arch_caps.is_gfx1010() {
+            let n = BATCH * M;
+            let poison = |gpu: &mut super::Gpu| {
+                gpu.upload_f32(&vec![f32::NAN; n], &[n])
+                    .expect("poison fused output")
+            };
+            let assert_proj = |got: &[f32], label: &str| {
+                for (index, (got, want)) in got.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        got.to_bits(),
+                        *want,
+                        "{label} batch row {}, output {}",
+                        index / M,
+                        index % M
+                    );
+                }
+            };
+
+            let y_q = poison(&mut gpu);
+            let y_k = poison(&mut gpu);
+            let y_v = poison(&mut gpu);
+            gpu.gemm_qkv_hfq4g256_mq4v2(
+                &weight, &weight, &weight, &input, &y_q, &y_k, &y_v, M, M, M, K, BATCH,
+            )
+            .expect("MQ4 v2 qkv wrapper");
+            assert_proj(&gpu.download_f32(&y_q).expect("download q"), "qkv q");
+            assert_proj(&gpu.download_f32(&y_k).expect("download k"), "qkv k");
+            assert_proj(&gpu.download_f32(&y_v).expect("download v"), "qkv v");
+
+            let y_gate = poison(&mut gpu);
+            let y_up = poison(&mut gpu);
+            gpu.gemm_gate_up_hfq4g256_mq4v2(
+                &weight, &weight, &input, &y_gate, &y_up, M, M, K, BATCH,
+            )
+            .expect("MQ4 v2 gate/up wrapper");
+            assert_proj(&gpu.download_f32(&y_gate).expect("download gate"), "gate");
+            assert_proj(&gpu.download_f32(&y_up).expect("download up"), "up");
+
+            let y_qkv = poison(&mut gpu);
+            let y_z = poison(&mut gpu);
+            let y_beta = poison(&mut gpu);
+            let y_alpha = poison(&mut gpu);
+            gpu.gemm_qkvza_hfq4g256_mq4v2(
+                &weight, &weight, &weight, &weight, &input, &y_qkv, &y_z, &y_beta, &y_alpha, M, M,
+                M, M, K, BATCH,
+            )
+            .expect("MQ4 v2 qkvza wrapper");
+            assert_proj(
+                &gpu.download_f32(&y_qkv).expect("download qkv"),
+                "qkvza qkv",
+            );
+            assert_proj(&gpu.download_f32(&y_z).expect("download z"), "qkvza z");
+            assert_proj(
+                &gpu.download_f32(&y_beta).expect("download beta"),
+                "qkvza beta",
+            );
+            assert_proj(
+                &gpu.download_f32(&y_alpha).expect("download alpha"),
+                "qkvza alpha",
             );
         }
     }
