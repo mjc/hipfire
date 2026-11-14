@@ -1960,6 +1960,14 @@ fn resolve_chat_template_overrides(model_path: &str) -> Option<(String, String)>
 /// Effective template for an HFQ load plus its provenance description.
 /// `(None, None)` when the artifact has no template and no built-in applies.
 fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> (Option<String>, Option<String>) {
+    let (template, source) = resolve_chat_template_selected(hfq, model_path);
+    (template.map(place_system_text_before_qwen_tools), source)
+}
+
+fn resolve_chat_template_selected(
+    hfq: &HfqFile,
+    model_path: &str,
+) -> (Option<String>, Option<String>) {
     if let Some((s, source)) = resolve_chat_template_overrides(model_path) {
         return (Some(s), Some(source));
     }
@@ -2010,11 +2018,11 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> (Option<String>, Op
 /// Arch 5/6 template after configured/per-model overrides: embedded HFQ
 /// `tokenizer_config.chat_template` when present, else froggeric fallback.
 /// Ornith 1.5 basenames get a load-time Qwen3.8-shaped `reasoning_effort`
-/// adaptation of the embedded (non-native) parent template; other models and
-/// the froggeric missing-template path are left alone. Returns the template
-/// and its provenance description.
+/// adaptation of the embedded (non-native) parent template. Every result then
+/// gets the tools-after-system reorder when it still has the stock tools-first
+/// system turn. Returns the template and its provenance description.
 fn qwen35_template_from_embedded(embedded: Option<String>, model_path: &str) -> (String, String) {
-    match embedded {
+    let (template, source) = match embedded {
         Some(t) if is_ornith15_artifact(model_path) => {
             let (t, adapted) = adapt_ornith15_embedded_chat_template(t);
             let source = if adapted {
@@ -2030,7 +2038,153 @@ fn qwen35_template_from_embedded(embedded: Option<String>, model_path: &str) -> 
             "built-in fallback: froggeric qwen35 template (artifact has no embedded chat_template)"
                 .to_string(),
         ),
+    };
+    (place_system_text_before_qwen_tools(template), source)
+}
+
+/// Stock Qwen templates open the system turn with `# Tools` and append the
+/// real system text after the tool contract. Render the normal system text
+/// first and keep the tool contract after it. No-tools branches are untouched.
+/// A template that does not contain exactly one tools-first open and one
+/// matching trailing append is returned unchanged, so the rewrite is idempotent.
+fn place_system_text_before_qwen_tools(template: String) -> String {
+    const HEADER_DQ: &str =
+        "    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}";
+    const HEADER_SQ: &str =
+        "    {{- '# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>' }}";
+    const OPEN_IM: &str = "    {{- '<|im_start|>system\\n' }}";
+    const REASONING_BETWEEN: &str = concat!(
+        "    {%- if reasoning_instructions %}\n",
+        "        {{- reasoning_instructions + '\\n\\n' }}\n",
+        "    {%- endif %}\n",
+    );
+    const APPEND_SYSTEM: &str = concat!(
+        "    {%- if messages[0].role == 'system' %}\n",
+        "        {%- set content = render_content(messages[0].content, false, true)|trim %}\n",
+        "        {%- if content %}\n",
+        "            {{- '\\n\\n' + content }}\n",
+        "        {%- endif %}\n",
+        "    {%- endif %}\n",
+        "    {{- '<|im_end|>\\n' }}",
+    );
+    const APPEND_RAON: &str = concat!(
+        "    {%- if messages[0].role == 'system' %}\n",
+        "        {%- set content = render_content(messages[0].content, true)|trim %}\n",
+        "        {%- if content %}\n",
+        "            {{- '\\n\\n' + content }}\n",
+        "        {%- endif %}\n",
+        "    {%- endif %}\n",
+        "    {{- '<|im_end|>\\n' }}",
+    );
+    const APPEND_SC: &str = concat!(
+        "    {%- if _sc %}\n",
+        "        {{- '\\n\\n' + _sc }}\n",
+        "    {%- endif %}\n",
+        "    {{- '<|im_end|>\\n' }}",
+    );
+    const IM_END: &str = "    {{- '<|im_end|>\\n' }}";
+    const OPEN_REASONING_FIXED: &str = concat!(
+        "    {%- if messages[0].role == 'system' %}\n",
+        "        {%- set content = render_content(messages[0].content, false, true)|trim %}\n",
+        "    {%- else %}\n",
+        "        {%- set content = '' %}\n",
+        "    {%- endif %}\n",
+        "    {{- '<|im_start|>system\\n' }}\n",
+        "    {%- if reasoning_instructions %}\n",
+        "        {{- reasoning_instructions + '\\n\\n' }}\n",
+        "    {%- endif %}\n",
+        "    {%- if content %}\n",
+        "        {{- content + '\\n\\n' }}\n",
+        "    {%- endif %}\n",
+        "    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}"
+    );
+    const OPEN_PLAIN_DQ_FIXED: &str = concat!(
+        "    {%- if messages[0].role == 'system' %}\n",
+        "        {%- set content = render_content(messages[0].content, false, true)|trim %}\n",
+        "        {%- if content %}\n",
+        "            {{- '<|im_start|>system\\n' + content + '\\n\\n' }}\n",
+        "        {%- else %}\n",
+        "            {{- '<|im_start|>system\\n' }}\n",
+        "        {%- endif %}\n",
+        "    {%- else %}\n",
+        "        {{- '<|im_start|>system\\n' }}\n",
+        "    {%- endif %}\n",
+        "    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}"
+    );
+    const OPEN_RAON_FIXED: &str = concat!(
+        "    {%- if messages[0].role == 'system' %}\n",
+        "        {%- set content = render_content(messages[0].content, true)|trim %}\n",
+        "        {%- if content %}\n",
+        "            {{- '<|im_start|>system\\n' + content + '\\n\\n' }}\n",
+        "        {%- else %}\n",
+        "            {{- '<|im_start|>system\\n' }}\n",
+        "        {%- endif %}\n",
+        "    {%- else %}\n",
+        "        {{- '<|im_start|>system\\n' }}\n",
+        "    {%- endif %}\n",
+        "    {{- '# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>' }}"
+    );
+    const OPEN_SC_FIXED: &str = concat!(
+        "    {%- if _sc %}\n",
+        "        {{- '<|im_start|>system\\n' + _sc + '\\n\\n' }}\n",
+        "    {%- else %}\n",
+        "        {{- '<|im_start|>system\\n' }}\n",
+        "    {%- endif %}\n",
+        "    {{- '# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>' }}"
+    );
+
+    let open_reasoning = format!("{OPEN_IM}\n{REASONING_BETWEEN}{HEADER_DQ}");
+    let open_plain_dq = format!("{OPEN_IM}\n{HEADER_DQ}");
+    let open_plain_sq = format!("{OPEN_IM}\n{HEADER_SQ}");
+
+    try_move_system_before_tools(
+        &template,
+        &open_reasoning,
+        OPEN_REASONING_FIXED,
+        APPEND_SYSTEM,
+        IM_END,
+    )
+    .or_else(|| {
+        try_move_system_before_tools(
+            &template,
+            &open_plain_dq,
+            OPEN_PLAIN_DQ_FIXED,
+            APPEND_SYSTEM,
+            IM_END,
+        )
+    })
+    .or_else(|| {
+        try_move_system_before_tools(
+            &template,
+            &open_plain_sq,
+            OPEN_RAON_FIXED,
+            APPEND_RAON,
+            IM_END,
+        )
+    })
+    .or_else(|| {
+        try_move_system_before_tools(&template, &open_plain_sq, OPEN_SC_FIXED, APPEND_SC, IM_END)
+    })
+    .unwrap_or(template)
+}
+
+/// Replace one tools-first open and its trailing system-content append.
+/// `None` when either marker is missing or repeated.
+fn try_move_system_before_tools(
+    template: &str,
+    open: &str,
+    open_fixed: &str,
+    append: &str,
+    im_end: &str,
+) -> Option<String> {
+    if template.matches(open).count() != 1 || template.matches(append).count() != 1 {
+        return None;
     }
+    Some(
+        template
+            .replacen(open, open_fixed, 1)
+            .replacen(append, im_end, 1),
+    )
 }
 
 /// Case-insensitive basename match for Ornith 1.5 MQ4/MQ4R artifacts.
@@ -8294,7 +8448,7 @@ mod registry_tests {
     }
 
     #[test]
-    fn unrelated_qwen_basename_is_untouched() {
+    fn qwen_basename_moves_system_text_before_tools() {
         let skeleton = ornith_parent_template_skeleton();
         for path in [
             "qwen3.6-35b-a3b.mq4",
@@ -8304,14 +8458,25 @@ mod registry_tests {
             "not-ornith-1.5-35b.mq4",
         ] {
             let (got, source) = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
-            assert_eq!(got, skeleton, "path {path} must not adapt");
+            assert_ne!(
+                got, skeleton,
+                "path {path} must move system text before # Tools"
+            );
+            assert!(
+                got.contains("'<|im_start|>system\\n' + content + '\\n\\n'"),
+                "path {path} must emit system text before the tool contract"
+            );
+            assert!(
+                !got.contains("{{- '\\n\\n' + content }}"),
+                "path {path} must not append system text after the tool contract"
+            );
             assert_eq!(source, super::SRC_EMBEDDED_HFQ, "path {path}");
             assert!(!got.contains("reasoning_effort"), "path {path}");
         }
     }
 
     #[test]
-    fn ornith15_wrong_extension_is_untouched() {
+    fn non_matching_extension_moves_system_text_before_tools() {
         let skeleton = ornith_parent_template_skeleton();
         for path in [
             "ornith-1.5-35b-a3b.mq6",
@@ -8324,17 +8489,20 @@ mod registry_tests {
             "ornith-1.5-35b-a3b.mq4r.bak",
         ] {
             let (got, source) = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
-            assert_eq!(got, skeleton, "path {path} must not adapt (extension gate)");
-            assert_eq!(source, super::SRC_EMBEDDED_HFQ, "path {path}");
+            assert_ne!(
+                got, skeleton,
+                "path {path} must still move system text before # Tools"
+            );
             assert!(
                 !got.contains("reasoning_effort"),
                 "path {path} must not gain effort"
             );
+            assert_eq!(source, super::SRC_EMBEDDED_HFQ, "path {path}");
         }
     }
 
     #[test]
-    fn already_native_ornith_template_stays_unchanged() {
+    fn native_effort_template_moves_system_text_before_tools() {
         let native = format!(
             "{}{}",
             super::QWEN38_REASONING_BLOCK,
@@ -8343,7 +8511,15 @@ mod registry_tests {
         assert!(native.contains("reasoning_effort"));
         let (got, source) =
             super::qwen35_template_from_embedded(Some(native.clone()), "ornith-1.5-35b-a3b.mq4");
-        assert_eq!(got, native, "already-native must not be rewritten");
+        assert_ne!(
+            got, native,
+            "already-native effort template still needs the tools-after-system order"
+        );
+        assert!(
+            got.contains("'<|im_start|>system\\n' + content + '\\n\\n'"),
+            "system text must lead the tool contract"
+        );
+        assert!(!source.contains("adapter applied"));
         assert_eq!(source, super::SRC_EMBEDDED_HFQ);
     }
 
@@ -8420,12 +8596,16 @@ mod registry_tests {
                         sys.starts_with(instr),
                         "tools: instruction must lead system turn (effort={effort:?}): {sys:?}"
                     );
+                    let sys_at = sys.find("SYS").expect("tools: system content lost");
+                    let tools_at = sys.find("# Tools").expect("tools header");
                     assert!(
-                        sys.contains(&format!("{instr}\n\n# Tools")),
-                        "tools: instruction must sit before # Tools (effort={effort:?})"
+                        sys_at < tools_at,
+                        "tools: system text must precede # Tools (effort={effort:?}): {sys:?}"
                     );
-                    // system content still appended after tools block
-                    assert!(sys.contains("SYS"), "tools: system content lost");
+                    assert!(
+                        sys.contains(&format!("{instr}\n\nSYS\n\n# Tools")),
+                        "tools: normal system turn then tool contract (effort={effort:?}): {sys:?}"
+                    );
                 }
                 None => {
                     assert!(
@@ -8433,8 +8613,8 @@ mod registry_tests {
                         "medium must not inject instruction (tools): {sys:?}"
                     );
                     assert!(
-                        sys.starts_with("# Tools"),
-                        "medium tools system starts at # Tools: {sys:?}"
+                        sys.starts_with("SYS\n\n# Tools"),
+                        "medium tools system starts with the real system text: {sys:?}"
                     );
                 }
             }
