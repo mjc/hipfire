@@ -93,6 +93,12 @@ pub fn awq_has_rcp_planes(awq: &GpuTensor, k: usize) -> bool {
     awq.shape == [k, AWQ_RCP_ROWS]
 }
 
+/// Workgroups for `gemv_mq4g256v2_residual`. That kernel covers two output
+/// rows from `blockIdx.x << 1`, and a final odd row is the one-row tail.
+pub fn mq4v2_residual_workgroups(m: usize) -> u32 {
+    (m as u32).div_ceil(2)
+}
+
 #[cfg(test)]
 mod awq_rcp_planes_tests {
     use super::awq_rcp_planes;
@@ -13090,7 +13096,9 @@ impl Gpu {
     /// Module = v1 + `_mq4v2`, func = v2 symbol `gemv_mq4g256v2_residual`.
     /// Threads define through the `gemv_mq4g256v2_residual_for_arch` helper
     /// so the `gfx12_weight_cache_policy.inc` preamble is preserved.
-    /// Rows forced to 1 on non-RDNA3 (gfx1201 uses 1), matching v1.
+    /// The generic kernel covers two output rows per workgroup, so the grid is
+    /// [`mq4v2_residual_workgroups`]. The gfx1100 K=4096 noscratch path stays
+    /// one row per workgroup.
     pub fn gemv_hfq4g256_residual_mq4v2(
         &mut self,
         a_raw: &GpuTensor,
@@ -13150,21 +13158,14 @@ impl Gpu {
             }
             return result;
         }
-        // Preserve arch-dependent row selection identical to v1.
-        let rdna3 = self.arch_caps.is_rdna3_dgpu();
-        let rows = if rdna3 {
-            self.flags.gemv_rows.unwrap_or(1)
-        } else {
-            1
-        };
-        // For gfx1201 minimal dense set, rows=1 and no multirow/wave64 path is taken.
-        // Still thread define through the helper rather than bypassing it.
+        // The kernel indexes `blockIdx.x << 1`. A grid of M launches a no-op
+        // workgroup for every other row.
         let (v2_src, v2_entry) = kernels::gemv_mq4g256v2_residual_for_arch(&self.arch_caps);
         let (_, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps);
         // Exact gfx1151 runs the row-serialized no-spill twin under its own
         // unique module+entry so a stale HSACO cannot alias it; every other
         // architecture keeps the existing module and the default entry.
-        // Grid stays M (Slice 1 keeps scheduling and grid contraction separate).
+        // Both sources still cover two rows per workgroup.
         let module_v2: String;
         let func_name: &str;
         if self.arch_caps.is_gfx1151() {
@@ -13187,14 +13188,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
-        // Keep same grid/block as v1 generic: rows=1 → grid m, block 32.
-        // For non-multirow, cdna3, tight_grid cases the v1 also uses m (or m/2) but
-        // gfx1201 hits this else.
-        let grid = if rows > 1 {
-            ((m as u32) + rows as u32 - 1) / rows as u32
-        } else {
-            m as u32
-        };
+        let grid = mq4v2_residual_workgroups(m);
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256v2_residual", bytes);
