@@ -101,9 +101,22 @@ impl LlamaToolSplitter {
 
     /// Feed decode text in order. Returns content that is safe to stream.
     /// A trailing prefix of `[TOOL_CALLS]` is held so a marker split across
-    /// tokens is still recognized. A closed body that is not an array of
-    /// calls is an error.
+    /// tokens is still recognized. One call may close a span and open the
+    /// next. A closed body that is not an array of calls is an error.
     pub fn push(&mut self, text: &str) -> Result<String, LlamaToolSpanError> {
+        self.feed(text, false)
+    }
+
+    /// Like [`Self::push`], but returns once one array has closed.
+    ///
+    /// Bytes after that close stay in the prose hold. The decode drain uses
+    /// this so text that follows a call, including a `<think>` span, is
+    /// classified before another `[TOOL_CALLS]` marker can open.
+    pub fn push_one_span(&mut self, text: &str) -> Result<String, LlamaToolSpanError> {
+        self.feed(text, true)
+    }
+
+    fn feed(&mut self, text: &str, one_span: bool) -> Result<String, LlamaToolSpanError> {
         if !self.enabled {
             return Ok(text.to_owned());
         }
@@ -131,6 +144,9 @@ impl LlamaToolSplitter {
                         self.calls.extend(parsed);
                         self.pending.drain(..end);
                         self.phase = Phase::Prose;
+                        if one_span {
+                            break;
+                        }
                     }
                 },
             }
@@ -169,6 +185,32 @@ impl LlamaToolSplitter {
     pub fn calls(&self) -> &[ToolCall] {
         &self.calls
     }
+
+    /// True while a `[TOOL_CALLS]` array is open. Those bytes are not prose.
+    pub fn in_body(&self) -> bool {
+        self.phase == Phase::Body
+    }
+
+    /// Prose prefix held back so a split `[TOOL_CALLS]` marker can still match.
+    /// Empty while a body is open. The caller that classifies the following
+    /// prose takes this back; otherwise the prefix is stranded until finish.
+    pub fn take_prose_hold(&mut self) -> String {
+        if self.in_body() {
+            return String::new();
+        }
+        std::mem::take(&mut self.pending)
+    }
+}
+
+/// Content a finished tools-on turn streamed from `text`.
+///
+/// `[TOOL_CALLS]` arrays stay withheld. Text before, between, and after
+/// them is the assistant content a client echoes.
+pub fn visible_llama_tool_prose(text: &str) -> Result<String, LlamaToolSpanError> {
+    let mut splitter = LlamaToolSplitter::new(true);
+    let mut visible = splitter.push(text)?;
+    visible.push_str(&splitter.finish(LlamaToolEnd::Stop)?);
+    Ok(visible)
 }
 
 fn marker_prefix_suffix_len(text: &str) -> usize {
@@ -395,6 +437,24 @@ mod tests {
         assert!(splitter.push(raw).unwrap().is_empty());
         assert!(splitter.finish(LlamaToolEnd::Stop).unwrap().is_empty());
         assert_eq!(splitter.calls()[0].arguments["text"], "a <|im_end|> b");
+    }
+
+    #[test]
+    fn one_span_leaves_the_following_text_for_the_caller() {
+        let mut splitter = LlamaToolSplitter::new(true);
+        let visible = splitter
+            .push_one_span(
+                r#"[TOOL_CALLS][{"name":"ping"}]<think>[TOOL_CALLS][{"name":"reasoning_only"}]</think>"#,
+            )
+            .unwrap();
+        assert!(visible.is_empty());
+        assert_eq!(splitter.calls().len(), 1);
+        assert_eq!(splitter.calls()[0].name, "ping");
+        assert!(!splitter.in_body());
+        assert_eq!(
+            splitter.take_prose_hold(),
+            r#"<think>[TOOL_CALLS][{"name":"reasoning_only"}]</think>"#
+        );
     }
 
     #[test]
