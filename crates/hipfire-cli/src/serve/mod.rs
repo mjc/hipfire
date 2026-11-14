@@ -227,6 +227,51 @@ pub(crate) fn idle_model_expired(meta: &ServeMeta, idle_timeout: Duration) -> bo
         && meta.last_activity.elapsed() >= idle_timeout
 }
 
+const LAST_REQUEST_MODEL_FILE: &str = "last-request-model";
+
+fn last_request_model_path(root: &Path) -> PathBuf {
+    root.join(LAST_REQUEST_MODEL_FILE)
+}
+
+/// The model name a request last loaded. Empty, or a note that is not one
+/// line, is ignored.
+fn read_last_request_model(root: &Path) -> Option<String> {
+    let text = fs::read_to_string(last_request_model_path(root)).ok()?;
+    let name = text.trim();
+    if name.is_empty() || name.contains(['\n', '\r', '\0']) {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
+fn write_last_request_model(root: &Path, model: &str) -> std::io::Result<()> {
+    if model.is_empty() || model.contains(['\n', '\r', '\0']) {
+        return Ok(());
+    }
+    let path = last_request_model_path(root);
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, model)?;
+    fs::rename(&temporary, path)
+}
+
+/// Startup pre-warm. A request's model wins over the operator default when
+/// that note still names something on disk.
+fn startup_prewarm_model<'a>(default_model: &'a str, last_request: Option<&'a str>) -> &'a str {
+    last_request
+        .filter(|name| !name.is_empty())
+        .unwrap_or(default_model)
+}
+
+/// Idle unload frees an operator pre-warm nobody has asked for. The model a
+/// request loaded stays until a different model replaces it.
+fn idle_unload_blocked(resident: Option<&str>, pinned: Option<&str>) -> bool {
+    match (resident, pinned) {
+        (Some(resident), Some(pinned)) => resident == pinned,
+        _ => false,
+    }
+}
+
 /// `serve.pid`: which process is serve and how to reach it.
 ///
 /// `token` is the `/health` instance token and is not a secret. `manage_token`
@@ -433,6 +478,9 @@ pub(crate) struct ServeRuntime {
     /// The `model` string the resident model was loaded under; reloaded after
     /// a daemon restart.
     pub(crate) resident_model: Option<String>,
+    /// Model a request last asked for. Idle unload leaves it resident, and
+    /// the next serve pre-warms it instead of `serve.default_model`.
+    pub(crate) pinned_request_model: Option<String>,
     pub(crate) request_policy: RequestModelPolicy,
     /// Resolved (possibly scratch-clamped) `serve.max_batch_tokens`, forwarded
     /// on the multi-slot load params so the daemon's slot engine honours the
@@ -1764,11 +1812,22 @@ pub(crate) fn serve_foreground(
         .model
         .clone()
         .unwrap_or(config_string(&global, "serve.default_model")?);
+    // A request's model stays the startup choice while it still resolves.
+    // The operator default remains the fallback, and still idle-unloads
+    // until a request names a model.
+    let saved_request_model = read_last_request_model(&paths.root).filter(|name| {
+        matches!(
+            crate::resolve_model_path(paths, &registry, name),
+            Ok(Some(_))
+        )
+    });
+    let prewarm_model =
+        startup_prewarm_model(&default_model, saved_request_model.as_deref()).to_owned();
     // Started for the pre-warm model, when it is on disk.
     let prewarm_path = if args.no_prewarm {
         None
     } else {
-        crate::resolve_model_path(paths, &registry, &default_model)?
+        crate::resolve_model_path(paths, &registry, &prewarm_model)?
     };
     let engine = spawner.spawn(prewarm_path.as_deref())?;
     let max_request_bytes = config_u64(&global, "serve.max_request_bytes")?;
@@ -1958,6 +2017,7 @@ pub(crate) fn serve_foreground(
             multi_slot_prefill_chunk,
             spawner,
             resident_model: None,
+            pinned_request_model: saved_request_model.clone(),
             request_policy,
             max_batch_tokens,
         }),
@@ -2065,12 +2125,12 @@ pub(crate) fn serve_foreground(
                 .meta
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .loading_model = Some(default_model.clone());
+                .loading_model = Some(prewarm_model.clone());
             let mut runtime = shared
                 .runtime
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if let Err(error) = prewarm(&mut runtime, &shared.meta, &default_model) {
+            if let Err(error) = prewarm(&mut runtime, &shared.meta, &prewarm_model) {
                 // Exit with `runtime` still held, so no request waiting on it
                 // starts a load of its own.
                 eprintln!("[hipfire] {error:#}; exiting");
@@ -2124,6 +2184,12 @@ pub(crate) fn serve_foreground(
                     continue;
                 }
                 if runtime.current_path.is_some() {
+                    if idle_unload_blocked(
+                        runtime.resident_model.as_deref(),
+                        runtime.pinned_request_model.as_deref(),
+                    ) {
+                        continue;
+                    }
                     let result = runtime.engine.unload();
                     if result.is_ok() {
                         runtime.clear_resident(&shared.meta);
@@ -2506,6 +2572,12 @@ impl ServeRuntime {
                 tag.unwrap_or_else(|| model.to_owned())
             };
             self.resident_model = Some(model.to_owned());
+            if origin == ModelOrigin::Request {
+                self.pinned_request_model = Some(model.to_owned());
+                if let Err(error) = write_last_request_model(&self.paths.root, model) {
+                    eprintln!("[hipfire] could not record the last requested model: {error}");
+                }
+            }
             // Baseline the spill monitor now that the load (and any prewarm)
             // is done, before taking the meta lock: it may ask the daemon
             // which arch the card is.
@@ -3125,6 +3197,45 @@ mod tests {
     fn idle_timeout_does_not_evict_a_loading_model() {
         let meta = idle_test_meta();
         assert!(!idle_model_expired(&meta, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn startup_prewarm_prefers_the_last_requested_model() {
+        assert_eq!(
+            startup_prewarm_model("qwen3.5:9b", Some("qwen3.5-9b.mq4")),
+            "qwen3.5-9b.mq4"
+        );
+        assert_eq!(startup_prewarm_model("qwen3.5:9b", None), "qwen3.5:9b");
+        assert_eq!(startup_prewarm_model("qwen3.5:9b", Some("")), "qwen3.5:9b");
+    }
+
+    #[test]
+    fn idle_unload_keeps_the_requested_model_and_drops_the_default() {
+        assert!(!idle_unload_blocked(Some("qwen3.5:9b"), None));
+        assert!(!idle_unload_blocked(None, Some("qwen3.5-9b.mq4")));
+        assert!(!idle_unload_blocked(
+            Some("qwen3.5:9b"),
+            Some("qwen3.5-9b.mq4")
+        ));
+        assert!(idle_unload_blocked(
+            Some("qwen3.5-9b.mq4"),
+            Some("qwen3.5-9b.mq4")
+        ));
+    }
+
+    #[test]
+    fn last_request_model_note_round_trips_one_line() {
+        let paths = test_paths("last-request-model");
+        fs::create_dir_all(&paths.root).unwrap();
+        assert!(read_last_request_model(&paths.root).is_none());
+        write_last_request_model(&paths.root, "qwen3.5-9b.mq4").unwrap();
+        assert_eq!(
+            read_last_request_model(&paths.root).as_deref(),
+            Some("qwen3.5-9b.mq4")
+        );
+        fs::write(last_request_model_path(&paths.root), "one\ntwo").unwrap();
+        assert!(read_last_request_model(&paths.root).is_none());
+        let _ = fs::remove_dir_all(&paths.root);
     }
 
     #[test]
@@ -4130,6 +4241,7 @@ mod tests {
                 backoff: Duration::from_millis(10),
             },
             resident_model: Some("qwen3.8:27b".to_owned()),
+            pinned_request_model: None,
             request_policy: RequestModelPolicy {
                 allow_pull: false,
                 allow_paths: false,

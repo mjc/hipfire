@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: serve keeps the model a request loaded.** The next start pre-warms that model instead of `serve.default_model`, and idle unload leaves it resident. The operator default still unloads on idle until a request names a model.
+
 ## v0.4.5 — 2026-10-30
 
 Highlights (details in the entries below):
