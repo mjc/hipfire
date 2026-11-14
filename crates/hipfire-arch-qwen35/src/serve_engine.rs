@@ -1076,17 +1076,11 @@ impl Rig {
 
         preflight_alloc(planned, vram_free as u64, "SlotEngine")
             .map_err(|e| format!("preflight refused: {e}"))?;
-        // Discrete GPUs: keep model pages in page cache (fadvise-per-tensor
-        // forces a full re-read on every load). UMA keeps eviction to avoid
-        // OOM vs hipMalloc staging. Mirrors carriers.rs — without this, the
-        // default `evict_page_cache=true` drops the mmap in prepare(), and
-        // post-weight tensor reads (e.g. vision weights) panic on None.
-        hfq.set_evict_page_cache(
-            hipfire_config::developer_var("HIPFIRE_PAGE_EVICTION")
-                .ok()
-                .map(|v| v != "0")
-                .unwrap_or_else(|| gpu.is_uma()),
-        );
+        // Evict so prepare drops the mapping and the trunk upload preads
+        // each tensor once. A discrete GPU used to keep the mapping, and
+        // the copy faulted the file after those pages were reclaimed.
+        // Inline vision still reads through the mapping, so it loads first.
+        hfq.set_evict_page_cache(true);
         // The capture gate and the CPU-exec coverage line are model-scoped: this
         // slots path loads weights directly (not through
         // `Architecture::load_weights_with_placement`), so it must set the flag,
@@ -1097,19 +1091,14 @@ impl Rig {
         hipfire_dispatch::reject_cpu_exec_under_redline(host_weights, gpu.replay.is_enabled())
             .map_err(|e| format!("qwen35: {e}"))?;
         crate::qwen35::load::report_cpu_exec_coverage(&hfq, &config, Some(&placement));
-        let (weights, pinned_host_bytes): (Qwen35Weights, u64) = {
-            let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-            let layout = qwen35::Layout::single(config.n_layers).with_placement(placement.clone());
-            let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
-                .map_err(|e| format!("load weights: {e}"))?;
-            (weights, layer_bytes.host_bytes(&placement))
-        };
 
         // ── Vision tower loading ──────────────────────────────────────────
         // When `vl_path` is set, vision weights load from the standalone .vl
         // sidecar (a standard HFQM container with only model.visual.* tensors
         // and config.vision_config in its metadata). Otherwise, fall back to
         // inline vision tensors in the trunk HFQ (backward compat).
+        // This runs before the trunk upload: prepare drops the trunk mapping
+        // when eviction is on, and the inline tower reads that mapping.
         let (vision_config, vision_weights) = if cfg.is_vl {
             if let Some(vl) = &cfg.vl_path {
                 eprintln!(
@@ -1162,6 +1151,22 @@ impl Rig {
             }
         } else {
             (None, None)
+        };
+
+        let (weights, pinned_host_bytes): (Qwen35Weights, u64) = {
+            let mut src = qwen35::HfqSource::new(&mut hfq, &config);
+            let layout = qwen35::Layout::single(config.n_layers).with_placement(placement.clone());
+            let weights =
+                match qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout) {
+                    Ok(weights) => weights,
+                    Err(e) => {
+                        if let Some(vw) = vision_weights {
+                            vw.free_gpu(&mut gpu);
+                        }
+                        return Err(format!("load weights: {e}"));
+                    }
+                };
+            (weights, layer_bytes.host_bytes(&placement))
         };
 
         // ── MTP head loading ──────────────────────────────────────────────

@@ -301,18 +301,28 @@ fn read_positional_exact(
 const HEAD_TENSOR_NAME: &str = "lm_head.weight";
 
 impl HfqFile {
-    /// Start a background parallel cache warmer: N worker threads pread the
-    /// data region chunk-sequentially into the page cache while the loader
-    /// uploads tensors. Rationale (measured 2026-08-22, gfx1100 + btrfs md0):
-    /// a single `FADV_WILLNEED` does not saturate the array (~1.7 GB/s
-    /// effective serial reads), while 6 concurrent readers reach ~4.5 GB/s;
-    /// overlapping those reads with H2D uploads hides most of the disk time.
-    /// No-op when page-cache eviction is enabled (UMA — warming would double
-    /// RAM pressure). The returned guard stops the workers on drop.
+    /// Start readers that `pread` this file into the page cache in 16 MiB
+    /// chunks, eight at a time.
+    ///
+    /// On a gfx1100 host (2026-08-23) that shape reached about 4.5 GB/s after
+    /// the cache was dropped; one `FADV_WILLNEED` stayed near 1.7 GB/s. The
+    /// warmer does not run when this file evicts the page cache. It does not
+    /// consult `mincore`: a reader without write permission receives an
+    /// all-ones residency vector, so a cold file looks fully cached. A hit
+    /// in a cache that is already warm is just a cache hit.
+    ///
+    /// Call [`CacheWarmerGuard::finish`] before uploading from the mapping.
+    /// A mapped copy faults those same pages, the fault window stays at its
+    /// initial size, and these positioned reads then hit pages the faults
+    /// already brought in. Dropping the guard stops the workers instead of
+    /// waiting for them. `finish` records full coverage on this file when
+    /// every indexed byte was read and no worker reported an error.
+    /// Packed-expert zero-copy follows that record.
     #[cfg(unix)]
     pub fn start_cache_warmup(&self) -> CacheWarmerGuard {
-        if self.evict_page_cache || self.mostly_page_cached() {
-            return CacheWarmerGuard::empty();
+        let covered = std::sync::Arc::clone(&self.cache_warmup_covered);
+        if self.evict_page_cache {
+            return CacheWarmerGuard::empty("evict", covered);
         }
         let end = self
             .tensors
@@ -320,7 +330,7 @@ impl HfqFile {
             .map(|t| t.data_offset + t.data_size)
             .unwrap_or(0);
         if end == 0 {
-            return CacheWarmerGuard::empty();
+            return CacheWarmerGuard::empty("empty", covered);
         }
         const CHUNK: usize = 16 << 20;
         // Measured 2026-08-23 on gfx1100 + btrfs md0, time-to-99%-resident for
@@ -331,11 +341,13 @@ impl HfqFile {
         const THREADS: usize = 8;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let progress = std::sync::Arc::new(WarmupProgress::default());
         let path = self.path.clone();
         let mut handles = Vec::with_capacity(THREADS);
         for _ in 0..THREADS {
             let stop = stop.clone();
             let next = next.clone();
+            let progress = progress.clone();
             let path = path.clone();
             // Fallible spawn: under thread exhaustion (RLIMIT_NPROC, cgroup
             // pids.max) `thread::spawn` would panic mid-load and kill the
@@ -345,10 +357,11 @@ impl HfqFile {
                 .name("hfq-cache-warmer".into())
                 .spawn(move || {
                     let Ok(file) = std::fs::File::open(&path) else {
+                        progress
+                            .errors
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return;
                     };
-                    use std::os::unix::io::AsRawFd;
-                    let fd = file.as_raw_fd();
                     let mut buf = vec![0u8; CHUNK];
                     loop {
                         if stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -360,21 +373,20 @@ impl HfqFile {
                             return;
                         }
                         let len = CHUNK.min(end - off);
-                        let mut got = 0usize;
-                        while got < len {
-                            let n = unsafe {
-                                libc::pread(
-                                    fd,
-                                    buf[got..].as_mut_ptr() as *mut libc::c_void,
-                                    len - got,
-                                    (off + got) as libc::off_t,
-                                )
-                            };
-                            if n <= 0 {
-                                return;
-                            }
-                            got += n as usize;
+                        let (got, err) = read_positional_exact(
+                            |dst, abs| file_read_at(&file, dst, abs),
+                            off as u64,
+                            &mut buf[..len],
+                        );
+                        if err.is_some() || got < len {
+                            progress
+                                .errors
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
                         }
+                        progress
+                            .bytes
+                            .fetch_add(got as u64, std::sync::atomic::Ordering::Relaxed);
                     }
                 }) {
                 Ok(handle) => handles.push(handle),
@@ -382,18 +394,28 @@ impl HfqFile {
             }
         }
         if handles.is_empty() {
-            return CacheWarmerGuard::empty();
+            return CacheWarmerGuard::empty("spawn", covered);
         }
         CacheWarmerGuard {
             stop,
+            progress,
+            covered,
+            workers: handles.len(),
+            expected_bytes: end as u64,
+            started: Some(std::time::Instant::now()),
+            elapsed: std::time::Duration::ZERO,
+            skipped: None,
+            finished: false,
             handles: Some(handles),
         }
     }
 
-    /// Fraction of data pages already resident in the page cache, via
-    /// `mincore` over an untouched shared mapping (mapping does not fault
-    /// pages in, so this is free). Used to skip the warmer when a repeat
-    /// load would only re-copy an already-resident file.
+    /// Fraction of data pages `mincore` reports resident.
+    ///
+    /// The mapping is untouched, so the probe itself does not fault pages
+    /// in. A caller that can read the file but cannot write it receives an
+    /// all-ones vector, so this must not decide whether a cold read is
+    /// required. Weight warmup and packed-expert upload do not call it.
     #[cfg(unix)]
     pub fn mostly_page_cached(&self) -> bool {
         let end = self
@@ -428,11 +450,9 @@ impl HfqFile {
     }
 
     /// [`Self::mostly_page_cached`] memoized per file instance. The probe
-    /// maps + mincores the whole multi-GB file (~0.4 s on an 18.8 GB model),
-    /// so callers inside a layer sweep must not re-run it per layer — but the
-    /// answer belongs to THIS file: a process-global memo goes stale when the
-    /// daemon swaps models (a warm model A would make a cold model B take the
-    /// zero-copy path and soft-fault serially at ~0.25 GB/s).
+    /// maps and mincores the whole multi-GB file (~0.4 s on an 18.8 GB
+    /// model). A reader without write permission receives an all-ones
+    /// vector, so weight warmup and packed-expert upload do not consult it.
     #[cfg(unix)]
     pub fn mostly_page_cached_memo(&self) -> bool {
         match self.pages_resident_memo.get() {
@@ -462,13 +482,88 @@ impl HfqFile {
     /// Non-unix fallback: nothing to warm.
     #[cfg(not(unix))]
     pub fn start_cache_warmup(&self) -> CacheWarmerGuard {
-        CacheWarmerGuard::empty()
+        CacheWarmerGuard::empty(
+            "unsupported",
+            std::sync::Arc::clone(&self.cache_warmup_covered),
+        )
     }
 }
 
-/// Stops the cache-warmup workers when dropped (load finished or abandoned).
+struct WarmupProgress {
+    bytes: std::sync::atomic::AtomicU64,
+    errors: std::sync::atomic::AtomicU32,
+}
+
+impl Default for WarmupProgress {
+    fn default() -> Self {
+        Self {
+            bytes: std::sync::atomic::AtomicU64::new(0),
+            errors: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+/// Result of [`CacheWarmerGuard::finish`].
+pub struct CacheWarmupReport {
+    /// Workers that were started. Zero when the warmer did not run.
+    pub workers: usize,
+    /// Bytes successfully read into the page cache.
+    pub bytes_read: u64,
+    /// Indexed range the workers were asked to cover, in bytes. Zero when
+    /// no workers ran.
+    pub expected_bytes: u64,
+    /// Time from start until the workers joined. Zero when no workers ran.
+    pub elapsed: std::time::Duration,
+    /// Chunk reads, file opens, or worker panics. An interrupted read is
+    /// retried and is not counted here.
+    pub errors: u32,
+    /// Why no workers ran: `evict`, `empty`, `spawn`, or `unsupported`.
+    /// `None` when workers ran.
+    pub skipped: Option<&'static str>,
+}
+
+impl std::fmt::Display for CacheWarmupReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.skipped {
+            Some(reason) => write!(f, "skipped ({reason})"),
+            None if self.expected_bytes > 0 && self.bytes_read != self.expected_bytes => write!(
+                f,
+                "{} workers, {:.3}/{:.3} GB in {:.2}s, {} errors",
+                self.workers,
+                self.bytes_read as f64 / 1e9,
+                self.expected_bytes as f64 / 1e9,
+                self.elapsed.as_secs_f64(),
+                self.errors
+            ),
+            None => write!(
+                f,
+                "{} workers, {:.3} GB in {:.2}s, {} errors",
+                self.workers,
+                self.bytes_read as f64 / 1e9,
+                self.elapsed.as_secs_f64(),
+                self.errors
+            ),
+        }
+    }
+}
+
+/// Page-cache warmup started by [`HfqFile::start_cache_warmup`].
+///
+/// [`Self::finish`] waits until the workers have read their range. Drop
+/// asks them to stop and then joins, so dropping the guard is not a
+/// completion wait.
 pub struct CacheWarmerGuard {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    progress: std::sync::Arc<WarmupProgress>,
+    /// Shared with the [`HfqFile`]. [`Self::finish`] stores `true` only
+    /// after a complete read.
+    covered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    workers: usize,
+    expected_bytes: u64,
+    started: Option<std::time::Instant>,
+    elapsed: std::time::Duration,
+    skipped: Option<&'static str>,
+    finished: bool,
     #[cfg(unix)]
     handles: Option<Vec<std::thread::JoinHandle<()>>>,
     #[cfg(not(unix))]
@@ -476,23 +571,93 @@ pub struct CacheWarmerGuard {
 }
 
 impl CacheWarmerGuard {
-    fn empty() -> Self {
+    fn empty(
+        skipped: &'static str,
+        covered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         Self {
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress: std::sync::Arc::new(WarmupProgress::default()),
+            covered,
+            workers: 0,
+            expected_bytes: 0,
+            started: None,
+            elapsed: std::time::Duration::ZERO,
+            skipped: Some(skipped),
+            finished: true,
             handles: None,
+        }
+    }
+
+    /// Wait until every started worker has finished its range.
+    ///
+    /// A second call returns the same report. Unlike `Drop`, this does not
+    /// set the stop flag first. The report's byte count is the coverage;
+    /// threads exiting is not enough on its own. When `bytes_read` equals
+    /// `expected_bytes`, that range is non-empty, and `errors` is zero, this
+    /// stores the file's coverage flag. A skip, a short read, or any worker
+    /// error leaves the flag clear. Dropping the guard does not set it.
+    pub fn finish(&mut self) -> CacheWarmupReport {
+        if !self.finished {
+            self.finished = true;
+            self.join_handles();
+            if let Some(started) = self.started {
+                self.elapsed = started.elapsed();
+            }
+        }
+        let report = self.snapshot();
+        if report.expected_bytes > 0
+            && report.bytes_read == report.expected_bytes
+            && report.errors == 0
+        {
+            self.covered
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        report
+    }
+
+    fn snapshot(&self) -> CacheWarmupReport {
+        CacheWarmupReport {
+            workers: self.workers,
+            bytes_read: self
+                .progress
+                .bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            expected_bytes: self.expected_bytes,
+            elapsed: self.elapsed,
+            errors: self
+                .progress
+                .errors
+                .load(std::sync::atomic::Ordering::Relaxed),
+            skipped: self.skipped,
+        }
+    }
+
+    fn join_handles(&mut self) {
+        #[cfg(unix)]
+        if let Some(handles) = self.handles.take() {
+            for handle in handles {
+                if handle.join().is_err() {
+                    self.progress
+                        .errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.handles.take();
         }
     }
 }
 
-#[cfg(unix)]
 impl Drop for CacheWarmerGuard {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(handles) = self.handles.take() {
-            for h in handles {
-                let _ = h.join();
-            }
+        if self.finished {
+            return;
         }
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.join_handles();
     }
 }
 
@@ -583,6 +748,53 @@ impl SourceReaderImpl for HfqRangeReader {
     }
 }
 
+/// Indexed tensor bytes from one sequential read. `bytes[0]` is file offset `base`.
+struct ContiguousPayload {
+    base: usize,
+    bytes: Vec<u8>,
+}
+
+impl ContiguousPayload {
+    fn slice(&self, info: &HfqTensorInfo) -> Option<&[u8]> {
+        let start = info.data_offset.checked_sub(self.base)?;
+        let end = start.checked_add(info.data_size)?;
+        self.bytes.get(start..end)
+    }
+}
+
+/// Drops the contiguous payload when the load that asked for it finishes.
+pub struct ContiguousPayloadGuard<'a> {
+    file: &'a HfqFile,
+}
+
+impl Drop for ContiguousPayloadGuard<'_> {
+    fn drop(&mut self) {
+        self.file.clear_contiguous_payload();
+    }
+}
+
+/// `(file offset, length)` covering every range, or `None` when the ranges are
+/// empty or a hole between them is larger than 1 MiB.
+fn contiguous_span(ranges: &[(usize, usize)]) -> Option<(usize, usize)> {
+    if ranges.is_empty() {
+        return None;
+    }
+    let mut base = usize::MAX;
+    let mut end = 0usize;
+    let mut sum = 0usize;
+    for &(offset, size) in ranges {
+        let range_end = offset.checked_add(size)?;
+        base = base.min(offset);
+        end = end.max(range_end);
+        sum = sum.checked_add(size)?;
+    }
+    let span = end.checked_sub(base)?;
+    if span == 0 || span.saturating_sub(sum) > (1 << 20) {
+        return None;
+    }
+    Some((base, span))
+}
+
 /// Author-recommended sampling defaults baked into a .hfq's
 /// `generation_config` metadata, surfaced by [`HfqFile::recommended_sampling`].
 /// Each field is independently `Option` so the consumer can fall through to its
@@ -631,6 +843,9 @@ pub struct HfqFile {
     /// can't be evicted while the mapping exists (FADV_DONTNEED is ignored
     /// for mmap'd regions per Linux kernel docs).
     pread_buf: std::cell::RefCell<Vec<u8>>,
+    /// One sequential read of the indexed payload, when the tensors form a
+    /// single span. Empty unless [`Self::preload_contiguous_payload`] ran.
+    contiguous_payload: std::cell::RefCell<Option<ContiguousPayload>>,
     /// Whether tensor reads evict their pages after reading
     /// (`posix_fadvise(DONTNEED)`). Defaults to `true` — the historical
     /// behavior, required on unified-memory APUs where cached model pages
@@ -648,6 +863,11 @@ pub struct HfqFile {
     /// process global) so loading a second model in the same daemon probes
     /// its own file instead of inheriting the previous model's answer.
     pages_resident_memo: std::cell::Cell<u8>,
+    /// Set by [`CacheWarmerGuard::finish`] when this process read every
+    /// indexed byte and no worker reported an error. Starts false. A skip,
+    /// a short read, a worker error, or a drop that stops the workers
+    /// leaves it false. Packed-expert zero-copy follows this flag.
+    cache_warmup_covered: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Optional overlay HFQ whose tensors shadow this file's by name (the
     /// REAP load-time splice, SP3). When `Some`, every tensor read method
     /// consults the overlay first and falls back to the base. When `None`
@@ -1406,8 +1626,10 @@ impl HfqFile {
             mq3v2_symmetric,
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
+            contiguous_payload: std::cell::RefCell::new(None),
             evict_page_cache: true,
             pages_resident_memo: std::cell::Cell::new(0),
+            cache_warmup_covered: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             overlay: None,
             data_offset: data_abs,
             ple_rows: None,
@@ -1467,6 +1689,16 @@ impl HfqFile {
     /// Whether reads on this file evict pages after reading.
     pub fn evicts_page_cache(&self) -> bool {
         self.evict_page_cache
+    }
+
+    /// Whether this process finished a cache warmup that covered every
+    /// indexed byte with no worker error.
+    ///
+    /// Packed-expert upload borrows the mapping only when this is true.
+    /// The pages are resident because the warmer just read them.
+    pub fn cache_warmup_covered(&self) -> bool {
+        self.cache_warmup_covered
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Release the pread reuse buffer back to the allocator. After a
@@ -1800,6 +2032,89 @@ impl HfqFile {
         self.tensor_data(name)
     }
 
+    /// Read the indexed payload in one sequential pass when the tensors sit in
+    /// one span. Later reads slice or copy that buffer. The guard drops the
+    /// buffer so a long-lived file does not keep the weights in host RAM.
+    pub fn preload_contiguous_payload(&self) -> ContiguousPayloadGuard<'_> {
+        self.fill_contiguous_payload();
+        ContiguousPayloadGuard { file: self }
+    }
+
+    pub fn has_contiguous_payload(&self) -> bool {
+        self.contiguous_payload.borrow().is_some()
+    }
+
+    /// Run `body` on one tensor's bytes. Uses the contiguous payload when it
+    /// is loaded, otherwise one positioned read.
+    pub fn with_tensor_bytes<R>(
+        &self,
+        name: &str,
+        body: impl FnOnce(&HfqTensorInfo, &[u8]) -> R,
+    ) -> Option<R> {
+        if self.overlay.is_none() {
+            let guard = self.contiguous_payload.borrow();
+            if let Some(payload) = guard.as_ref() {
+                let idx = self.resolve_idx(name)?;
+                let info = &self.tensors[idx];
+                let bytes = payload.slice(info)?;
+                return Some(body(info, bytes));
+            }
+        }
+        let (info, data) = self.tensor_data_vec(name)?;
+        Some(body(info, &data))
+    }
+
+    fn clear_contiguous_payload(&self) {
+        *self.contiguous_payload.borrow_mut() = None;
+    }
+
+    /// Copy one tensor out of the payload. `None` when no payload is loaded
+    /// or this tensor sits outside it, so the caller can fall back to a read.
+    fn copy_contiguous_tensor(&self, idx: usize) -> Option<Vec<u8>> {
+        let guard = self.contiguous_payload.borrow();
+        let payload = guard.as_ref()?;
+        let src = payload.slice(&self.tensors[idx])?;
+        let mut buf = Vec::with_capacity(src.len());
+        buf.extend_from_slice(src);
+        Some(buf)
+    }
+
+    fn fill_contiguous_payload(&self) {
+        if self.overlay.is_some() || self.contiguous_payload.borrow().is_some() {
+            return;
+        }
+        #[cfg(any(unix, windows))]
+        {
+            let ranges: Vec<(usize, usize)> = self
+                .tensors
+                .iter()
+                .map(|tensor| (tensor.data_offset, tensor.data_size))
+                .collect();
+            let Some((base, span)) = contiguous_span(&ranges) else {
+                eprintln!("hfq: tensor ranges are not one span; reading each tensor");
+                return;
+            };
+            let mut bytes = vec![0u8; span];
+            let (read, _) = read_positional_exact(
+                |chunk, at| file_read_at(&self._file, chunk, at),
+                base as u64,
+                &mut bytes,
+            );
+            if read != span {
+                eprintln!(
+                    "hfq: contiguous read short ({read} of {span} bytes); reading each tensor"
+                );
+                return;
+            }
+            self.drop_pages_range(base, span);
+            eprintln!(
+                "hfq: read {} tensors ({span} bytes) in one pass",
+                self.tensors.len()
+            );
+            *self.contiguous_payload.borrow_mut() = Some(ContiguousPayload { base, bytes });
+        }
+    }
+
     /// Read tensor data using the best available path:
     /// - Unix / Windows: positioned read (`pread` / `seek_read`), independent
     ///   of the mmap, so it works after `drop_mmap()`; unix also fadvise_dontneeds
@@ -1817,6 +2132,10 @@ impl HfqFile {
             }
         }
         let idx = self.resolve_idx(name)?;
+        if let Some(copied) = self.copy_contiguous_tensor(idx) {
+            return Some((&self.tensors[idx], copied));
+        }
+
         let info = &self.tensors[idx];
 
         #[cfg(any(unix, windows))]
@@ -4666,6 +4985,108 @@ mod range_upload_release_tests {
         ranges[0].read_exact(&mut bytes).unwrap();
         assert_eq!(bytes, data);
     }
+
+    #[test]
+    fn evicting_warmup_reports_the_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights.hfq");
+        let tensors = vec![HfqMemTensor {
+            name: "w".to_string(),
+            quant_type: 16,
+            shape: vec![64, 64],
+            group_size: 0,
+            data: vec![7u8; 4096],
+        }];
+        write_hfqm_package_mem(&path, 16, "{}", &tensors).unwrap();
+        let mut hfq = HfqFile::open(&path).unwrap();
+        hfq.set_evict_page_cache(true);
+        let report = hfq.start_cache_warmup().finish();
+        assert_eq!(report.skipped, Some("evict"));
+        assert_eq!(report.workers, 0);
+        assert_eq!(report.bytes_read, 0);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.to_string(), "skipped (evict)");
+        assert!(!hfq.cache_warmup_covered());
+    }
+
+    /// A file that is already resident is still read. `mincore` is not a
+    /// reason to skip: without write permission it reports every page resident.
+    #[test]
+    fn resident_file_is_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights.hfq");
+        let data = vec![9u8; 256 * 1024];
+        let tensors = vec![HfqMemTensor {
+            name: "w".to_string(),
+            quant_type: 16,
+            shape: vec![256, 256],
+            group_size: 0,
+            data,
+        }];
+        write_hfqm_package_mem(&path, 16, "{}", &tensors).unwrap();
+        let mut hfq = HfqFile::open(&path).unwrap();
+        hfq.set_evict_page_cache(false);
+        assert!(!hfq.cache_warmup_covered());
+        let end = hfq
+            .tensors()
+            .last()
+            .map(|t| (t.data_offset + t.data_size) as u64);
+        let report = hfq.start_cache_warmup().finish();
+        assert_eq!(report.skipped, None, "{report}");
+        assert!(report.workers >= 1, "{report}");
+        assert_eq!(report.errors, 0, "{report}");
+        assert_eq!(Some(report.bytes_read), end, "{report}");
+        assert_eq!(report.expected_bytes, report.bytes_read, "{report}");
+        assert!(hfq.cache_warmup_covered());
+    }
+
+    /// A cold file's `finish` returns only after the workers have read the
+    /// indexed range. Filesystems that ignore `DONTNEED` (tmpfs) skip the
+    /// read assertion.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finish_reads_a_cold_file_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights.hfq");
+        let data: Vec<u8> = (0..(8 * 1024 * 1024u32)).map(|i| (i % 251) as u8).collect();
+        let tensors = vec![HfqMemTensor {
+            name: "w".to_string(),
+            quant_type: 16,
+            shape: vec![1024, 2048],
+            group_size: 0,
+            data,
+        }];
+        write_hfqm_package_mem(&path, 16, "{}", &tensors).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let advised =
+            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(advised, 0);
+        drop(file);
+        let len = std::fs::metadata(&path).unwrap().len();
+        let page = 4096u64;
+        let sample_at = (len / 2) / page * page;
+        if resident_pages(&path, sample_at, page)
+            .iter()
+            .all(|&resident| resident)
+        {
+            eprintln!("the file system kept the page; nothing to check");
+            return;
+        }
+        let mut hfq = HfqFile::open(&path).unwrap();
+        hfq.set_evict_page_cache(false);
+        let end = hfq
+            .tensors()
+            .last()
+            .map(|t| (t.data_offset + t.data_size) as u64);
+        let mut warmer = hfq.start_cache_warmup();
+        let report = warmer.finish();
+        assert_eq!(report.skipped, None, "{report}");
+        assert!(report.workers >= 1, "{report}");
+        assert_eq!(report.errors, 0, "{report}");
+        assert_eq!(Some(report.bytes_read), end, "{report}");
+        assert_eq!(warmer.finish().bytes_read, report.bytes_read);
+        assert!(hfq.cache_warmup_covered());
+    }
 }
 #[cfg(test)]
 mod metadata_overlay_tests {
@@ -5622,5 +6043,29 @@ mod mq3v2_symmetric_tests {
             !f.mq3v2_symmetric(),
             "asymmetric ladder base must report marker=false"
         );
+    }
+}
+
+#[cfg(test)]
+mod contiguous_span_tests {
+    use super::contiguous_span;
+
+    #[test]
+    fn accepts_padding_under_a_mebibyte() {
+        assert_eq!(
+            contiguous_span(&[(100, 10), (114, 20)]).unwrap(),
+            (100, 34)
+        );
+    }
+
+    #[test]
+    fn rejects_a_hole_past_a_mebibyte() {
+        let hole = (1 << 20) + 1;
+        assert!(contiguous_span(&[(0, 10), (10 + hole, 10)]).is_none());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(contiguous_span(&[]).is_none());
     }
 }
