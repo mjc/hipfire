@@ -16937,6 +16937,7 @@ effort = "high"
                         backoff: Duration::from_millis(10),
                     },
                     resident_model: None,
+                    pinned_request_model: None,
                     request_policy: crate::serve::RequestModelPolicy {
                         allow_pull: false,
                         allow_paths: false,
