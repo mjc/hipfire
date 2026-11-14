@@ -29,6 +29,26 @@ pub fn q8_0_batched_chunks(n: usize) -> impl Iterator<Item = (usize, usize)> {
         .map(move |off| (off, (n - off).min(Q8_0_BATCHED_MAX_BATCH)))
 }
 
+/// Activation rows a gfx1010 MQ4G256V2 prefill launch covers in one tiled
+/// kernel. Matches the chunk the existing planner admits on that arch.
+/// A shorter call stays on the 4-row x-batch GEMV.
+pub const MQ4V2_GFX1010_PREFILL_TILE: usize = 256;
+
+/// Dynamic LDS for one staged MQ4G256V2 weight row. Eight waves on gfx1010
+/// share 64 KiB, so 8 KiB keeps `__launch_bounds__(32, 8)` honest. A heavier
+/// row stays on the 4-row x-batch GEMV. Qwen 3.5 9B hidden K=4096 is 2176 B
+/// and intermediate K=12288 is 6528 B, both under this cap.
+pub const MQ4V2_GFX1010_PREFILL_LDS_MAX: usize = 8 * 1024;
+
+/// One tiled gfx1010 launch, rather than chunks of 4, when `batch` is at
+/// least [`MQ4V2_GFX1010_PREFILL_TILE`], `k` is a multiple of 256, and the
+/// weight row (`k/256*136`) fits [`MQ4V2_GFX1010_PREFILL_LDS_MAX`].
+pub fn mq4v2_gfx1010_prefill_tiled(k: usize, batch: usize) -> bool {
+    batch >= MQ4V2_GFX1010_PREFILL_TILE
+        && k.is_multiple_of(256)
+        && k / 256 * crate::dispatch::MQ4V2_GROUP_BYTES <= MQ4V2_GFX1010_PREFILL_LDS_MAX
+}
+
 // Safety routing is independent of optional PM family selectors: an admitted
 // eager verify must retain the actual singleton even when no tile is enabled.
 fn q8_0_exact_verify_scope(
@@ -41763,8 +41783,8 @@ impl Gpu {
     }
 
     /// Plain `Y = W·X` for each projection through [`Self::gemm_mq4g256v2`].
-    /// On gfx1010 that is the scalar x-batch GEMV, one launch group per
-    /// projection. Callers admit only that arch.
+    /// On gfx1010 a full chunk is one tiled launch per projection; a shorter
+    /// leftover is the 4-row x-batch GEMV. Callers admit only that arch.
     fn gemm_mq4g256v2_projections(
         &mut self,
         parts: &[(&GpuTensor, &GpuTensor, usize)],
@@ -41807,8 +41827,9 @@ impl Gpu {
     /// (gfx1100/1101/1102/1150/1151/gfx1200/1201) this method provides
     /// plain-GEMM semantics by zeroing output and routing through the
     /// arch-aware residual WMMA path (`gemm_hfq4g256_residual_mq4v2`,
-    /// which dispatches gfx12 vs gfx11 internally). Other GPUs use the
-    /// x-batched scalar V2 GEMV: the v1 scalar GEMM cannot decode V2 bytes
+    /// which dispatches gfx12 vs gfx11 internally). gfx1010 uses the tiled
+    /// prefill kernel for a full chunk and the x-batched scalar V2 GEMV for
+    /// a shorter leftover. The v1 scalar GEMM cannot decode V2 bytes
     /// (fp16 s0/z0/s1/z1 vs f32 scale/zero; WT2 KLD 12.1).
     pub fn gemm_mq4g256v2(
         &mut self,
@@ -42109,11 +42130,11 @@ impl Gpu {
         Ok(true)
     }
 
-    /// Plain `Y = W·X` over `batch_size` rows with the x-batched scalar V2
-    /// GEMV (chunks of 4). Each row is byte-identical to the singleton
-    /// `gemv_mq4g256v2` on that row (same per-row accumulation order), on
-    /// every architecture — unlike [`Self::gemm_mq4g256v2`], which routes
-    /// WMMA arches through a different reduction.
+    /// Plain `Y = W·X` over `batch_size` rows. A gfx1010 chunk whose weight
+    /// row fits in LDS is one tiled launch; every other call is the
+    /// x-batched scalar V2 GEMV (chunks of 4). Each row keeps the singleton
+    /// `gemv_mq4g256v2` accumulation order — unlike [`Self::gemm_mq4g256v2`]
+    /// on WMMA arches, which uses a different reduction.
     pub fn gemv_mq4g256v2_xbatch(
         &mut self,
         a_raw: &GpuTensor,
@@ -42126,9 +42147,11 @@ impl Gpu {
         self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
     }
 
-    /// MQ4G256V2 without WMMA: the x-batched scalar GEMV decodes each weight
-    /// row once for up to four input rows, keeping the scalar kernel's per-row
-    /// accumulation order. `residual` selects `Y += W·X` over `Y = W·X`.
+    /// MQ4G256V2 without WMMA. On exact gfx1010 a full chunk whose weight
+    /// row fits in LDS is one tiled launch ([`Self::gemm_mq4g256v2_prefill_gfx1010`]).
+    /// Every other call is the x-batched scalar GEMV, up to four input rows
+    /// per launch, with that kernel's per-row accumulation order. `residual`
+    /// selects `Y += W·X` over `Y = W·X`.
     #[allow(clippy::too_many_arguments)]
     fn gemm_mq4g256v2_xbatch(
         &mut self,
@@ -42144,6 +42167,11 @@ impl Gpu {
             return Err(crate::gemm_fp8_verify::fp8_verify_scope_error(
                 "gemm_mq4g256v2_xbatch",
             ));
+        }
+        if self.arch_caps.admits_mq4g256v2_xbatch_prefill()
+            && mq4v2_gfx1010_prefill_tiled(k, batch_size)
+        {
+            return self.gemm_mq4g256v2_prefill_gfx1010(a_raw, x, y, m, k, batch_size, residual);
         }
         let (func, source) = if residual {
             (
@@ -42207,6 +42235,77 @@ impl Gpu {
                 b
             })?;
         }
+        Ok(())
+    }
+
+    /// One gfx1010 launch of the LDS-staged MQ4G256V2 prefill kernel over
+    /// every activation row. The inner kernel still accumulates four rows
+    /// at a time, in the scalar GEMV's term order. `residual` selects
+    /// `Y += W·X`.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mq4g256v2_prefill_gfx1010(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        let (func, source) = if residual {
+            (
+                "gemm_mq4g256v2_prefill_gfx1010_residual",
+                kernels::GEMM_MQ4G256V2_PREFILL_GFX1010_RESIDUAL_SRC,
+            )
+        } else {
+            (
+                "gemm_mq4g256v2_prefill_gfx1010",
+                kernels::GEMM_MQ4G256V2_PREFILL_GFX1010_SRC,
+            )
+        };
+        assert!(
+            k.is_multiple_of(256),
+            "{func}: gfx1010 MQ4 v2 prefill requires K%256==0"
+        );
+        let row_bytes = k / 256 * crate::dispatch::MQ4V2_GROUP_BYTES;
+        assert!(
+            row_bytes <= MQ4V2_GFX1010_PREFILL_LDS_MAX,
+            "{func}: weight row {row_bytes} B exceeds the LDS cap"
+        );
+        self.bind_thread()?;
+        self.ensure_kernel(func, source, func)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let b_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &b_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            func,
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            row_bytes as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(b_val);
+                b
+            },
+        )?;
         Ok(())
     }
 
@@ -54725,8 +54824,189 @@ mod tests {
             );
         }
 
-        // The fused wrappers reach this plain x-batch path only on gfx1010.
-        // A WMMA host sends them through WMMA, so the comparison stays here.
+        // 256 rows is the gfx1010 prefill tile. K=768 still has a tail and
+        // fits the LDS cap, so gfx1010 takes one tiled launch. Every other
+        // arch stays on 4-row x-batch. Both match per-row gemv bit for bit.
+        {
+            const CHUNK: usize = 256;
+            let chunk_inputs: Vec<f32> = (0..CHUNK * K)
+                .map(|i| (((i * 41 + 3) % 257) as f32 - 128.0) / 131.0)
+                .collect();
+            let chunk_input = gpu
+                .upload_f32(&chunk_inputs, &[CHUNK * K])
+                .expect("upload chunk input");
+            let chunk_output = gpu
+                .upload_f32(&vec![f32::NAN; CHUNK * M], &[CHUNK * M])
+                .expect("poison chunk output");
+            gpu.gemm_mq4g256v2_xbatch(&weight, &chunk_input, &chunk_output, M, K, CHUNK, false)
+                .expect("MQ4 v2 chunk fallback");
+            let mut chunk_expected = Vec::with_capacity(CHUNK * M);
+            for row in 0..CHUNK {
+                let x = gpu
+                    .upload_f32(&chunk_inputs[row * K..(row + 1) * K], &[K])
+                    .expect("upload chunk row");
+                let y = gpu.zeros(&[M], DType::F32).expect("alloc chunk row");
+                gpu.gemv_mq4g256v2(&weight, &x, &y, M, K)
+                    .expect("MQ4 v2 chunk row GEMV");
+                gpu.hip.device_synchronize().expect("chunk row sync");
+                chunk_expected.extend(
+                    gpu.download_f32(&y)
+                        .expect("download chunk row")
+                        .into_iter()
+                        .map(f32::to_bits),
+                );
+            }
+            let chunk_actual = gpu.download_f32(&chunk_output).expect("download chunk");
+            for (index, (got, want)) in chunk_actual.iter().zip(&chunk_expected).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    *want,
+                    "chunk row {}, output {}",
+                    index / M,
+                    index % M
+                );
+            }
+            let chunk_initial: Vec<f32> = (0..CHUNK * M).map(|i| i as f32 * 0.125 - 3.0).collect();
+            let chunk_residual = gpu
+                .upload_f32(&chunk_initial, &[CHUNK * M])
+                .expect("upload chunk residual");
+            gpu.gemm_mq4g256v2_xbatch(&weight, &chunk_input, &chunk_residual, M, K, CHUNK, true)
+                .expect("MQ4 v2 chunk residual");
+            let chunk_residual = gpu
+                .download_f32(&chunk_residual)
+                .expect("download chunk residual");
+            for (index, ((got, base), plain)) in chunk_residual
+                .iter()
+                .zip(&chunk_initial)
+                .zip(&chunk_actual)
+                .enumerate()
+            {
+                assert_eq!(
+                    got.to_bits(),
+                    (base + plain).to_bits(),
+                    "chunk residual row {}, output {}",
+                    index / M,
+                    index % M
+                );
+            }
+            if gpu.arch_caps.is_gfx1010() {
+                let n = CHUNK * M;
+                let poison = |gpu: &mut super::Gpu| {
+                    gpu.upload_f32(&vec![f32::NAN; n], &[n])
+                        .expect("poison chunk fused output")
+                };
+                let assert_proj = |got: &[f32], label: &str| {
+                    for (index, (got, want)) in got.iter().zip(&chunk_actual).enumerate() {
+                        assert_eq!(
+                            got.to_bits(),
+                            want.to_bits(),
+                            "{label} chunk row {}, output {}",
+                            index / M,
+                            index % M
+                        );
+                    }
+                };
+                let y_q = poison(&mut gpu);
+                let y_k = poison(&mut gpu);
+                let y_v = poison(&mut gpu);
+                gpu.gemm_qkv_hfq4g256_mq4v2(
+                    &weight,
+                    &weight,
+                    &weight,
+                    &chunk_input,
+                    &y_q,
+                    &y_k,
+                    &y_v,
+                    M,
+                    M,
+                    M,
+                    K,
+                    CHUNK,
+                )
+                .expect("MQ4 v2 chunk qkv");
+                assert_proj(&gpu.download_f32(&y_q).expect("download chunk q"), "qkv q");
+                assert_proj(&gpu.download_f32(&y_k).expect("download chunk k"), "qkv k");
+                assert_proj(&gpu.download_f32(&y_v).expect("download chunk v"), "qkv v");
+                let y_gate = poison(&mut gpu);
+                let y_up = poison(&mut gpu);
+                gpu.gemm_gate_up_hfq4g256_mq4v2(
+                    &weight,
+                    &weight,
+                    &chunk_input,
+                    &y_gate,
+                    &y_up,
+                    M,
+                    M,
+                    K,
+                    CHUNK,
+                )
+                .expect("MQ4 v2 chunk gate/up");
+                assert_proj(
+                    &gpu.download_f32(&y_gate).expect("download chunk gate"),
+                    "gate",
+                );
+                assert_proj(&gpu.download_f32(&y_up).expect("download chunk up"), "up");
+                let y_qkv = poison(&mut gpu);
+                let y_z = poison(&mut gpu);
+                let y_beta = poison(&mut gpu);
+                let y_alpha = poison(&mut gpu);
+                gpu.gemm_qkvza_hfq4g256_mq4v2(
+                    &weight,
+                    &weight,
+                    &weight,
+                    &weight,
+                    &chunk_input,
+                    &y_qkv,
+                    &y_z,
+                    &y_beta,
+                    &y_alpha,
+                    M,
+                    M,
+                    M,
+                    M,
+                    K,
+                    CHUNK,
+                )
+                .expect("MQ4 v2 chunk qkvza");
+                assert_proj(
+                    &gpu.download_f32(&y_qkv).expect("download chunk qkv"),
+                    "qkvza qkv",
+                );
+                assert_proj(
+                    &gpu.download_f32(&y_z).expect("download chunk z"),
+                    "qkvza z",
+                );
+                assert_proj(
+                    &gpu.download_f32(&y_beta).expect("download chunk beta"),
+                    "qkvza beta",
+                );
+                assert_proj(
+                    &gpu.download_f32(&y_alpha).expect("download chunk alpha"),
+                    "qkvza alpha",
+                );
+                let y_res = gpu
+                    .upload_f32(&chunk_initial, &[n])
+                    .expect("upload chunk wrapper residual");
+                gpu.gemm_hfq4g256_residual_mq4v2(&weight, &chunk_input, &y_res, M, K, CHUNK)
+                    .expect("MQ4 v2 chunk residual wrapper");
+                let got = gpu
+                    .download_f32(&y_res)
+                    .expect("download chunk wrapper residual");
+                for (index, (got, want)) in got.iter().zip(&chunk_residual).enumerate() {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "residual wrapper chunk row {}, output {}",
+                        index / M,
+                        index % M
+                    );
+                }
+            }
+        }
+
+        // Six rows stay on the 4-row x-batch GEMV. The fused wrappers reach
+        // that path only on gfx1010. A WMMA host sends them through WMMA, so
+        // the comparison stays here.
         if gpu.arch_caps.is_gfx1010() {
             let n = BATCH * M;
             let poison = |gpu: &mut super::Gpu| {

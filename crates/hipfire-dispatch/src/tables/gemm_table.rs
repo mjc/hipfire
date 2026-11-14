@@ -385,7 +385,8 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     // MQ4G256V2 (qt44) plain and residual GEMM keys admit HasWmma plus exact
     // gfx1010. gfx1010 has no WMMA source; the fused wrappers call
-    // `gemm_mq4g256v2`, which uses the scalar x-batch GEMV. The other V2
+    // `gemm_mq4g256v2`, which uses the tiled chunk kernel for a full prefill
+    // chunk and the scalar x-batch GEMV for a shorter leftover. The other V2
     // widths stay HasWmma. Exact-verify and batched-lmhead keys stay on
     // their narrower predicates. MQ4CG256 remains gfx12-only.
     registry.register(KernelVariant {

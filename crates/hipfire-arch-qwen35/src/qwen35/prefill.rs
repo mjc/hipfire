@@ -4247,7 +4247,8 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // the HasWmma predicate on GemmMq*G256V2* keys and with
     // gemm_mq*g256v2's has_wmma() guard.
     // MQ4G256V2 on exact gfx1010 is separate: the fused wrappers call
-    // `gemm_mq4g256v2`, which uses the scalar x-batch GEMV. The gfx11
+    // `gemm_mq4g256v2`, which uses the tiled chunk kernel for a full prefill
+    // chunk and the scalar x-batch GEMV for a shorter leftover. The gfx11
     // kill switch does not apply. Other V2 widths stay refused there.
     // MQ4CG256 (qt45) remains gfx12-only until its gfx11 sibling lands.
     let mqv2_with_wmma = llama::mqv2_wmma_batchable(
@@ -8068,7 +8069,7 @@ mod tests {
         }
         assert!(
             is_batchable_la(DType::MQ4G256V2, "gfx1010"),
-            "MQ4G256V2 uses the scalar x-batch path on gfx1010"
+            "MQ4G256V2 prefill is admitted on gfx1010"
         );
         for arch in ["gfx1030", "gfx942", "gfx906"] {
             assert!(
@@ -8264,7 +8265,7 @@ mod tests {
                 assert_eq!(
                     is_batchable_la(dt, arch),
                     qwen_admits,
-                    "qwen35 MQ4G256V2 on gfx1010 is the x-batch exception; {dt:?} on {arch}"
+                    "qwen35 MQ4G256V2 on gfx1010 is the non-WMMA exception; {dt:?} on {arch}"
                 );
                 assert!(
                     !llama::is_batchable_la(dt, arch),

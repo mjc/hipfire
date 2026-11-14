@@ -661,8 +661,8 @@ pub enum ArchPredicate {
     HasWave32,
     HasWmma,
     /// WMMA arches, plus exact gfx1010. MQ4G256V2 plain and residual prefill
-    /// on gfx1010 uses the scalar x-batch GEMV. Not for other V2 widths or
-    /// the exact-verify keys.
+    /// on gfx1010 uses the tiled chunk kernel, or the scalar x-batch GEMV
+    /// for a shorter leftover. Not for other V2 widths or the exact-verify keys.
     HasWmmaOrMq4V2Gfx1010,
     /// `has_wmma_w32()` — gfx11-family wave32 WMMA (RDNA3 + RDNA3.5), EXCLUDING
     /// gfx12/RDNA4. For WMMA kernels with NO gfx12 source sibling (e.g.

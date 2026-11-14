@@ -100,7 +100,8 @@ pub fn process_gpu_arch() -> Option<&'static str> {
 }
 
 /// Exact gfx1010. MQ4G256V2 plain and residual batched prefill there uses
-/// the scalar x-batch GEMV. Other gfx10 parts stay on the per-token path.
+/// the tiled chunk kernel when the weight row fits, and the scalar x-batch
+/// GEMV for a shorter leftover. Other gfx10 parts stay on the per-token path.
 pub fn arch_admits_mq4g256v2_xbatch_prefill(arch: &str) -> bool {
     arch == "gfx1010"
 }
