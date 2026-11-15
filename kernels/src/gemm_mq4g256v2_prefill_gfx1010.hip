@@ -9,39 +9,97 @@
 #define HIPFIRE_MQ4G256V2_PREFILL_GFX1010_KERNEL gemm_mq4g256v2_prefill_gfx1010
 #endif
 
-// gfx1010 MQ4G256V2 prefill. One wave per output row copies that weight row
-// into LDS once, then replays gemv_mq4g256v2_xbatch for activation rows in
-// steps of 4. The inner width stays 4: a wider accumulator set spills on
-// this arch and a spill changes the FMA order. Inside a step the terms match
-// that kernel (XDOG across a quad, tail into acc0..acc2, pairwise sum,
-// shfl_down from 16). HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE selects y += acc.
+// gfx1010 MQ4G256V2 prefill. One workgroup owns ROWS output rows, one wave
+// each. Those waves share one K-group of the current 4-token activation
+// step through LDS, then each wave replays the scalar GEMV against its own
+// weight group. The inner width stays 4: a wider accumulator set spills on
+// this arch and a spill changes the FMA order. Inside a group the eight
+// nibble terms match gemv_mq4g256v2_xbatch (one expression per accumulator).
+// Across a quad the four groups still land in acc0..acc3, the tail still
+// lands in acc0..acc2, and the warp reduces with the same pairwise sum and
+// shfl_down from 16. HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE selects y += acc.
 //
-// The host launches this for a chunk whose weight row fits the LDS cap.
-// A shorter leftover stays on gemv_mq4g256v2_xbatch.
+// Weight groups are read from global once per group. Staging every weight
+// row plus this activation tile does not fit the 8 KiB cap (two K=4096 rows
+// are already 4352 B, and the 4-token group tile is 4096 B). The host still
+// admits only a chunk whose weight row is under that cap.
+//
+// ROWS matches MQ4V2_GFX1010_PREFILL_ROWS. The host launches block (32, ROWS).
 
 #define HIPFIRE_MQ4G256V2_PREFILL_STEP 4
+#define HIPFIRE_MQ4G256V2_PREFILL_ROWS 8
+#define HIPFIRE_MQ4G256V2_PREFILL_THREADS \
+    (HIPFIRE_MQ4G256V2_PREFILL_ROWS * 32)
 
-__launch_bounds__(32, 8)
+// Fill xtile with x[b, g*256 : g*256+256) for the live tokens, then add this
+// group's eight nibble terms into acc[0..local_b). Every thread in the
+// workgroup runs both barriers. g_index and acc_slot are each evaluated once
+// per expansion, so g+1 is safe.
+#define MQ4V2_PREFILL_GROUP(g_index, acc_slot)                                     \
+    do {                                                                           \
+        const int g_ = (g_index);                                                  \
+        unsigned int pk_ = 0;                                                      \
+        float sc_ = 0.0f;                                                          \
+        float zp_ = 0.0f;                                                          \
+        if (active) {                                                              \
+            const char* gp_ = row_weights + (long long)g_ * 136;                   \
+            const unsigned int hA_ = *(const unsigned int*)(gp_);                  \
+            const unsigned int hB_ = *(const unsigned int*)(gp_ + 4);              \
+            const unsigned int hs_ = (tid < 16) ? hA_ : hB_;                       \
+            sc_ = __half2float(__ushort_as_half((unsigned short)(hs_ & 0xFFFFu)));\
+            zp_ = __half2float(__ushort_as_half((unsigned short)(hs_ >> 16)));    \
+            pk_ = *(const unsigned int*)(gp_ + 8 + boff);                          \
+        }                                                                          \
+        const int n4_ = local_b * 64;                                              \
+        for (int i_ = linear; i_ < n4_; i_ += HIPFIRE_MQ4G256V2_PREFILL_THREADS) { \
+            const int b_ = i_ >> 6;                                                \
+            const int v_ = i_ & 63;                                                \
+            const float* src_ =                                                    \
+                x_tile + ((long long)b_ * K + (long long)g_ * 256 + (v_ << 2));   \
+            const float4 got_ = *(const float4*)src_;                             \
+            const int dst_ = (b_ << 8) + (v_ << 2);                                \
+            xtile[dst_] = got_.x;                                                  \
+            xtile[dst_ + 1] = got_.y;                                              \
+            xtile[dst_ + 2] = got_.z;                                              \
+            xtile[dst_ + 3] = got_.w;                                              \
+        }                                                                          \
+        __syncthreads();                                                           \
+        if (active) {                                                              \
+            _Pragma("unroll")                                                      \
+            for (int b_ = 0; b_ < HIPFIRE_MQ4G256V2_PREFILL_STEP; b_++) {          \
+                if (b_ >= local_b) break;                                          \
+                const float* xb_ = xtile + (b_ << 8) + (tid << 3);                 \
+                (acc_slot)[b_] +=                                                  \
+                    (sc_ * (float)(pk_ & 0xFu) + zp_) * xb_[0]                     \
+                    + (sc_ * (float)((pk_ >> 4) & 0xFu) + zp_) * xb_[1]            \
+                    + (sc_ * (float)((pk_ >> 8) & 0xFu) + zp_) * xb_[2]            \
+                    + (sc_ * (float)((pk_ >> 12) & 0xFu) + zp_) * xb_[3]           \
+                    + (sc_ * (float)((pk_ >> 16) & 0xFu) + zp_) * xb_[4]           \
+                    + (sc_ * (float)((pk_ >> 20) & 0xFu) + zp_) * xb_[5]           \
+                    + (sc_ * (float)((pk_ >> 24) & 0xFu) + zp_) * xb_[6]           \
+                    + (sc_ * (float)((pk_ >> 28) & 0xFu) + zp_) * xb_[7];          \
+            }                                                                      \
+        }                                                                          \
+        __syncthreads();                                                           \
+    } while (0)
+
+__launch_bounds__(HIPFIRE_MQ4G256V2_PREFILL_THREADS, 1)
 extern "C" __global__ void HIPFIRE_MQ4G256V2_PREFILL_GFX1010_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,   // [B x K]
     float* __restrict__ y,         // [B x M]
     int M, int K, int B
 ) {
-    extern __shared__ unsigned int smem[];
-    const int row = blockIdx.x;
-    if (row >= M) return;
+    __shared__ float xtile[HIPFIRE_MQ4G256V2_PREFILL_STEP * 256];
+
     const int tid = threadIdx.x;
-    const int groups_per_row = K / 256;
-    const unsigned int* src =
-        (const unsigned int*)(A + (long long)row * groups_per_row * 136);
-    const int n_u32 = groups_per_row * (136 / 4);
-    for (int i = tid; i < n_u32; i += 32) {
-        smem[i] = src[i];
-    }
-    __syncthreads();
-    const char* row_ptr = (const char*)smem;
+    const int wave = threadIdx.y;
+    const int row = blockIdx.x * HIPFIRE_MQ4G256V2_PREFILL_ROWS + wave;
+    const bool active = row < M;
+    const int groups_per_row = K >> 8;
+    const char* row_weights = A + (active ? (long long)row * groups_per_row * 136 : 0);
     const int boff = tid * 4;
+    const int linear = wave * 32 + tid;
 
     for (int b0 = 0; b0 < B; b0 += HIPFIRE_MQ4G256V2_PREFILL_STEP) {
         int local_b = B - b0;
@@ -57,7 +115,10 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_PREFILL_GFX1010_KERNEL(
         float acc3[HIPFIRE_MQ4G256V2_PREFILL_STEP];
         #pragma unroll
         for (int b = 0; b < HIPFIRE_MQ4G256V2_PREFILL_STEP; b++) {
-            acc0[b] = 0.0f; acc1[b] = 0.0f; acc2[b] = 0.0f; acc3[b] = 0.0f;
+            acc0[b] = 0.0f;
+            acc1[b] = 0.0f;
+            acc2[b] = 0.0f;
+            acc3[b] = 0.0f;
         }
 
         const int quads = groups_per_row >> 2;
@@ -65,103 +126,35 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_PREFILL_GFX1010_KERNEL(
 
         for (int q = 0; q < quads; q++) {
             const int g = q << 2;
-            const char* gp0 = row_ptr + g * 136;
-            const char* gp1 = gp0 + 136;
-            const char* gp2 = gp1 + 136;
-            const char* gp3 = gp2 + 136;
-
-            const unsigned int hA0 = *(const unsigned int*)(gp0);
-            const unsigned int hB0 = *(const unsigned int*)(gp0 + 4);
-            const unsigned int hs0 = (tid < 16) ? hA0 : hB0;
-            float sc0 = __half2float(__ushort_as_half((unsigned short)(hs0 & 0xFFFFu)));
-            float zp0 = __half2float(__ushort_as_half((unsigned short)(hs0 >> 16)));
-            const unsigned int hA1 = *(const unsigned int*)(gp1);
-            const unsigned int hB1 = *(const unsigned int*)(gp1 + 4);
-            const unsigned int hs1 = (tid < 16) ? hA1 : hB1;
-            float sc1 = __half2float(__ushort_as_half((unsigned short)(hs1 & 0xFFFFu)));
-            float zp1 = __half2float(__ushort_as_half((unsigned short)(hs1 >> 16)));
-            const unsigned int hA2 = *(const unsigned int*)(gp2);
-            const unsigned int hB2 = *(const unsigned int*)(gp2 + 4);
-            const unsigned int hs2 = (tid < 16) ? hA2 : hB2;
-            float sc2 = __half2float(__ushort_as_half((unsigned short)(hs2 & 0xFFFFu)));
-            float zp2 = __half2float(__ushort_as_half((unsigned short)(hs2 >> 16)));
-            const unsigned int hA3 = *(const unsigned int*)(gp3);
-            const unsigned int hB3 = *(const unsigned int*)(gp3 + 4);
-            const unsigned int hs3 = (tid < 16) ? hA3 : hB3;
-            float sc3 = __half2float(__ushort_as_half((unsigned short)(hs3 & 0xFFFFu)));
-            float zp3 = __half2float(__ushort_as_half((unsigned short)(hs3 >> 16)));
-
-            unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
-            unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
-            unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
-            unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
-
-            const int base = g * 256 + tid * 8;
-
-            #define XDOG(pk, sc, zp, bs, a) \
-                (a) += (sc * (float)((pk) & 0xFu)         + zp) * xb[(bs)]     \
-                     + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * xb[(bs) + 1] \
-                     + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * xb[(bs) + 2] \
-                     + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * xb[(bs) + 3] \
-                     + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * xb[(bs) + 4] \
-                     + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * xb[(bs) + 5] \
-                     + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * xb[(bs) + 6] \
-                     + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * xb[(bs) + 7]
-
-            #pragma unroll
-            for (int b = 0; b < HIPFIRE_MQ4G256V2_PREFILL_STEP; b++) {
-                if (b >= local_b) break;
-                const float* xb = x_tile + (long long)b * K;
-                XDOG(pk0, sc0, zp0, base,       acc0[b]);
-                XDOG(pk1, sc1, zp1, base + 256, acc1[b]);
-                XDOG(pk2, sc2, zp2, base + 512, acc2[b]);
-                XDOG(pk3, sc3, zp3, base + 768, acc3[b]);
-            }
-            #undef XDOG
+            MQ4V2_PREFILL_GROUP(g, acc0);
+            MQ4V2_PREFILL_GROUP(g + 1, acc1);
+            MQ4V2_PREFILL_GROUP(g + 2, acc2);
+            MQ4V2_PREFILL_GROUP(g + 3, acc3);
         }
-
-        #define XTAIL(pk, sc, zp, bs, a) \
-            (a) += (sc * (float)((pk) & 0xFu)         + zp) * xb[(bs)]     \
-                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * xb[(bs) + 1] \
-                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * xb[(bs) + 2] \
-                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * xb[(bs) + 3] \
-                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * xb[(bs) + 4] \
-                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * xb[(bs) + 5] \
-                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * xb[(bs) + 6] \
-                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * xb[(bs) + 7]
-
         for (int t = 0; t < tail; t++) {
             const int g = (quads << 2) + t;
-            const char* gp = row_ptr + g * 136;
-            const unsigned int hA = *(const unsigned int*)(gp);
-            const unsigned int hB = *(const unsigned int*)(gp + 4);
-            const unsigned int hs = (tid < 16) ? hA : hB;
-            float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
-            float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
-            unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
-            const int base = g * 256 + tid * 8;
+            if (t == 0) {
+                MQ4V2_PREFILL_GROUP(g, acc0);
+            } else if (t == 1) {
+                MQ4V2_PREFILL_GROUP(g, acc1);
+            } else {
+                MQ4V2_PREFILL_GROUP(g, acc2);
+            }
+        }
+
+        if (active) {
             #pragma unroll
             for (int b = 0; b < HIPFIRE_MQ4G256V2_PREFILL_STEP; b++) {
                 if (b >= local_b) break;
-                const float* xb = x_tile + (long long)b * K;
-                if (t == 0)      { XTAIL(pk, sc, zp, base, acc0[b]); }
-                else if (t == 1) { XTAIL(pk, sc, zp, base, acc1[b]); }
-                else             { XTAIL(pk, sc, zp, base, acc2[b]); }
-            }
-        }
-        #undef XTAIL
-
-        #pragma unroll
-        for (int b = 0; b < HIPFIRE_MQ4G256V2_PREFILL_STEP; b++) {
-            if (b >= local_b) break;
-            float acc = (acc0[b] + acc1[b]) + (acc2[b] + acc3[b]);
-            for (int offset = 16; offset > 0; offset >>= 1)
-                acc += __shfl_down(acc, offset);
+                float acc = (acc0[b] + acc1[b]) + (acc2[b] + acc3[b]);
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    acc += __shfl_down(acc, offset);
 #if defined(HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE)
-            if (tid == 0) y_tile[(long long)b * M + row] += acc;
+                if (tid == 0) y_tile[(long long)b * M + row] += acc;
 #else
-            if (tid == 0) y_tile[(long long)b * M + row] = acc;
+                if (tid == 0) y_tile[(long long)b * M + row] = acc;
 #endif
+            }
         }
     }
 }

@@ -2791,9 +2791,9 @@ pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch_residual\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2_xbatch.hip")
 );
-/// gfx1010 chunk prefill. One wave per output row stages the weight row in
-/// LDS, then runs the x-batch body in steps of 4 across the whole activation
-/// tile. `y[b] = A . x[b]`.
+/// gfx1010 chunk prefill. Eight waves share one K-group of the current four
+/// activation rows through LDS, and each wave runs the x-batch body for its
+/// own output row. `y[b] = A . x[b]`.
 pub const GEMM_MQ4G256V2_PREFILL_GFX1010_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_PREFILL_GFX1010_KERNEL gemm_mq4g256v2_prefill_gfx1010\n",
     include_str!("../../../kernels/src/gemm_mq4g256v2_prefill_gfx1010.hip")
