@@ -3537,6 +3537,21 @@ mod tests {
     }
 
     #[test]
+    fn llama3_rope_type_is_refused() {
+        let mut raw = fixture();
+        raw["text_config"]["rope_parameters"] = json!({
+            "rope_type": "llama3",
+            "rope_theta": 10000000.0,
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192
+        });
+        let err = Qwen4Config::from_value(&json!({"config": raw})).unwrap_err();
+        assert!(err.contains("llama3"), "{err}");
+    }
+
+    #[test]
     fn parses_nested_metadata_and_exact_geometry() {
         let metadata = json!({"config": fixture()});
         let cfg = Qwen4Config::from_value(&metadata).expect("fixture should parse");
