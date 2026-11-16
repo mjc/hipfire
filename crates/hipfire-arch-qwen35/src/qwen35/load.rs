@@ -5362,11 +5362,12 @@ fn try_load_packed_experts(
     let down_contig = contiguous_tensor_span(hfq, &down_names, down_stride);
 
     let t_read = Instant::now();
-    // Zero-copy only pays when pages are resident: a borrowed-slice H2D from
-    // an evicted cache soft-faults serially inside the copy loop (~0.25 GB/s
-    // off disk), while the parallel-pread fallback reads with multiple lanes.
-    let zero_copy_ok = matches!((gate_up_contig, down_contig), (Some(_), Some(_)))
-        && hfq.mostly_page_cached_memo();
+    // A borrowed slice copied with hipMemcpy faults a cold mapping inside
+    // the copy (~0.25 GB/s). That path follows a warmup this process
+    // finished with full coverage: the warmer's preads already brought the
+    // pages in. Otherwise the parallel pread below does the read.
+    let zero_copy_ok =
+        gate_up_contig.is_some() && down_contig.is_some() && hfq.cache_warmup_covered();
     let (gate_up_host, down_host) = if zero_copy_ok {
         let (Some(gu), Some(dn)) = (gate_up_contig, down_contig) else {
             unreachable!("zero_copy_ok implies both spans resolved");
