@@ -333,6 +333,7 @@ pub fn load_weights(
 ) -> HipResult<Qwen2Weights> {
     #[cfg(unix)]
     hfq.drop_mmap();
+    let _payload = hfq.preload_contiguous_payload();
 
     eprintln!("qwen2: loading token_embd...");
     let (embd_token, embd_format) = load_embed_tokens(hfq, gpu, cfg)?;
@@ -371,10 +372,10 @@ fn load_embed_tokens(
     cfg: &Qwen2Config,
 ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
     let name = "model.embed_tokens.weight";
-    let (info, data) = hfq
-        .tensor_data_vec(name)
-        .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
-    load_embedding(gpu, info.quant_type, &data, cfg.vocab_size, cfg.hidden_size)
+    hfq.with_tensor_bytes(name, |info, data| {
+        load_embedding(gpu, info.quant_type, data, cfg.vocab_size, cfg.hidden_size)
+    })
+    .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"))
 }
 
 /// Load the lm_head. For tied-embedding configs, re-upload the embedding
@@ -476,11 +477,10 @@ fn load_norm_weight_raw(
     name: &str,
     n: usize,
 ) -> HipResult<GpuTensor> {
-    let (info, data) = hfq
-        .tensor_data_vec(name)
-        .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
-    let t = dequant_norm(gpu, info.quant_type, &data, &[n], 0.0)?;
-    Ok(t)
+    hfq.with_tensor_bytes(name, |info, data| {
+        dequant_norm(gpu, info.quant_type, data, &[n], 0.0)
+    })
+    .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"))
 }
 
 /// TODO(transformer-extraction): duplicates `load_weight_tensor` +
@@ -499,8 +499,10 @@ fn load_weight_tensor(
     target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
     for cand in candidates(name) {
-        if let Some((info, data)) = hfq.tensor_data_vec(&cand) {
-            return dequant_weight_raw(gpu, info.quant_type, &data, m, k, target);
+        if let Some(result) = hfq.with_tensor_bytes(&cand, |info, data| {
+            dequant_weight_raw(gpu, info.quant_type, data, m, k, target)
+        }) {
+            return result;
         }
     }
     panic!("qwen2: tensor not found: {name}");

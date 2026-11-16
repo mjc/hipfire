@@ -149,26 +149,15 @@ fn qwen35_tensor_data_vec<'a>(
     None
 }
 
-/// Borrowed-first variant of [`qwen35_tensor_data_vec`]: returns the mmap
-/// slice directly when the mapping is alive (dGPU loads keep it, so weight
-/// uploads DMA straight out of page-cache pages with no heap staging copy);
-/// falls back to the owned pread Vec on UMA (mmap dropped there). Same
-/// candidate resolution.
+/// Owned bytes for a weight upload. The read is positioned
+/// ([`qwen35_tensor_data_vec`]) even when the mapping is still alive, so the
+/// copy to the device does not fault that mapping.
 fn qwen35_tensor_data_cow<'a>(
     hfq: &'a HfqFile,
     name: &str,
 ) -> Option<(&'a HfqTensorInfo, std::borrow::Cow<'a, [u8]>)> {
-    for candidate in qwen35_tensor_name_candidates(name) {
-        if let Some((info, data)) = hfq.tensor_data(&candidate) {
-            return Some((info, std::borrow::Cow::Borrowed(data)));
-        }
-    }
-    for candidate in qwen35_tensor_name_candidates(name) {
-        if let Some((info, data)) = hfq.tensor_data_vec(&candidate) {
-            return Some((info, std::borrow::Cow::Owned(data)));
-        }
-    }
-    None
+    let (info, data) = qwen35_tensor_data_vec(hfq, name)?;
+    Some((info, std::borrow::Cow::Owned(data)))
 }
 
 fn load_norm_weight(
@@ -1135,96 +1124,54 @@ pub fn load_weight_tensor(
     candidates: fn(&str) -> Vec<String>,
     target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
-    // Zero-copy first: when the mmap is alive (dGPU loads keep it), DMA
-    // straight from the page-cache-backed slice — no heap staging copy.
-    // Pread fallback preserves UMA behavior (mmap dropped there).
-    #[cfg(any(unix, windows))]
-    {
-        let mut wt: Option<WeightTensor> = None;
-        let mut matched: Option<String> = None;
-        for candidate in candidates(name) {
-            if let Some((info, data)) = hfq.tensor_data(&candidate) {
-                let qt = info.quant_type;
-                wt = Some(load_weight_tensor_raw(gpu, qt, data, m, k, target)?);
-                matched = Some(candidate);
-                break;
-            }
-            if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
-                let qt = info.quant_type;
-                wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k, target)?);
-                matched = Some(candidate);
-                break;
-            }
+    // Positioned read into the buffer the upload copies. A live mapping is
+    // not the source: copying that slice faults pages the kernel has already
+    // reclaimed.
+    let mut wt: Option<WeightTensor> = None;
+    let mut matched: Option<String> = None;
+    for candidate in candidates(name) {
+        if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
+            let qt = info.quant_type;
+            wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k, target)?);
+            matched = Some(candidate);
+            break;
         }
-        let mut wt = wt.unwrap_or_else(|| panic!("tensor not found: {name}"));
-        // Phase A Stage A — populate awq_scale when the dtype is on
-        // the AWQ allow-list (centralized at `DType::supports_awq_sidecar`).
-        // The pread call invalidates the prior pread_buf borrow, but
-        // the weight bytes have already been uploaded to GPU (owned by
-        // `wt.buf`) so the borrow no longer matters.
-        if wt.gpu_dtype.supports_awq_sidecar() {
-            if let Some(matched_name) = matched.as_deref() {
-                wt.awq_scale = load_awq_scale_for(hfq, gpu, matched_name, k)
-                    .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
-            } else {
-                wt.awq_scale = load_awq_scale_for(hfq, gpu, name, k);
-            }
-        }
-        // MQ4V2-Lloyd codebook: fail CLOSED when a qt=52 tensor has no valid
-        // sidecar. `load_lloyd_lut` errors; `?` propagates (no silent uniform).
-        if wt.gpu_dtype == DType::MQ4G256V2Lloyd {
-            let lutted = |n: &str| hipfire_runtime::hfq::load_lloyd_lut(hfq, n).ok();
-            let luts = matched
-                .as_deref()
-                .and_then(lutted)
-                .or_else(|| lutted(name))
-                .ok_or_else(|| {
-                    HipError::new(
-                        0,
-                        &format!(
-                            "MQ4G256V2Lloyd weight {name} has no codebook sidecar: \
-                             re-quantize with a build that emits lloyd_levels (F32 [16])"
-                        ),
-                    )
-                })?;
-            wt.lloyd_lut_e4m3 = Some(luts.0);
-            wt.lloyd_lut_f16 = Some(luts.1);
-            wt.lloyd_lut_c16 = Some(luts.2);
-        }
-        return Ok(wt);
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let (info, data, matched_name) = {
-            let mut found = None;
-            for candidate in candidates(name) {
-                if let Some((info, data)) = hfq.tensor_data(&candidate) {
-                    found = Some((info, data, candidate));
-                    break;
-                }
-            }
-            found.unwrap_or_else(|| panic!("tensor not found: {name}"))
-        };
-        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k, target)?;
-        if wt.gpu_dtype.supports_awq_sidecar() {
-            wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
+    let mut wt = wt.unwrap_or_else(|| panic!("tensor not found: {name}"));
+    // Phase A Stage A — populate awq_scale when the dtype is on
+    // the AWQ allow-list (centralized at `DType::supports_awq_sidecar`).
+    // The pread guard above has ended. The weight bytes are already on the
+    // device (`wt.buf`), and the next pread reuses `pread_buf`.
+    if wt.gpu_dtype.supports_awq_sidecar() {
+        if let Some(matched_name) = matched.as_deref() {
+            wt.awq_scale = load_awq_scale_for(hfq, gpu, matched_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
+        } else {
+            wt.awq_scale = load_awq_scale_for(hfq, gpu, name, k);
         }
-        if wt.gpu_dtype == DType::MQ4G256V2Lloyd {
-            let (e4m3, f16, c16) = hipfire_runtime::hfq::load_lloyd_lut(hfq, &matched_name)
-                .or_else(|_| hipfire_runtime::hfq::load_lloyd_lut(hfq, name))
-                .map_err(|e| {
-                    HipError::new(
-                        0,
-                        &format!("MQ4G256V2Lloyd weight {name} has no codebook sidecar: {e}"),
-                    )
-                })?;
-            wt.lloyd_lut_e4m3 = Some(e4m3);
-            wt.lloyd_lut_f16 = Some(f16);
-            wt.lloyd_lut_c16 = Some(c16);
-        }
-        Ok(wt)
     }
+    // MQ4V2-Lloyd codebook: fail CLOSED when a qt=52 tensor has no valid
+    // sidecar. `load_lloyd_lut` errors; `?` propagates (no silent uniform).
+    if wt.gpu_dtype == DType::MQ4G256V2Lloyd {
+        let lutted = |n: &str| hipfire_runtime::hfq::load_lloyd_lut(hfq, n).ok();
+        let luts = matched
+            .as_deref()
+            .and_then(lutted)
+            .or_else(|| lutted(name))
+            .ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!(
+                        "MQ4G256V2Lloyd weight {name} has no codebook sidecar: \
+                         re-quantize with a build that emits lloyd_levels (F32 [16])"
+                    ),
+                )
+            })?;
+        wt.lloyd_lut_e4m3 = Some(luts.0);
+        wt.lloyd_lut_f16 = Some(luts.1);
+        wt.lloyd_lut_c16 = Some(luts.2);
+    }
+    Ok(wt)
 }
 
 /// REAP keep variant of [`load_weight_tensor`]: gather the tensor's first-axis
@@ -3055,19 +3002,10 @@ impl WeightSource for HfqSource<'_> {
         // Partial GPU offload is resolved by the loader (see
         // `hipfire_runtime::offload`), which also prints the residency line; this
         // source no longer decides or announces placement.
-        // Keep the mmap alive on discrete GPUs (the carrier cleared
-        // `evict_page_cache` there, on Linux and Windows alike): weight uploads
-        // DMA straight out of page-cache pages with no heap staging copy —
-        // measured 11–16 GB/s end-to-end vs ~4 GB/s through a pread staging
-        // buffer (measured on Linux).
-        // UMA keeps the drop — evict=true is exactly the carrier's UMA
-        // signal (`Gpu::is_uma`, hipDeviceAttributeIntegrated, which is also
-        // queried on Windows) — so mapped model pages and the GPU copy are
-        // not both resident and cached model pages can't starve hipMalloc of
-        // RAM. After the drop every tensor read in this source goes through
-        // `tensor_data_pread` / `tensor_data_vec`, which use positioned reads
-        // (`pread` on unix, `seek_read` on Windows) on a normally buffered
-        // handle; no unbuffered (FILE_FLAG_NO_BUFFERING) reopen is used.
+        // Drop the mapping when this file evicts pages after a read and the
+        // load has one device. Weight bytes are positioned reads either way
+        // (`pread` on unix, `seek_read` on Windows, on a normally buffered
+        // handle). A mapping that is still alive is not the upload source.
         //
         // NOTE: do NOT madvise-populate the mapping here. A blocking
         // MAP_POPULATE measured identical totals (it relocates the same
@@ -5241,44 +5179,9 @@ fn packed_mq4_experts_supported(gpu: &Gpu) -> bool {
     gpu.arch_caps.is_rdna3()
 }
 
-/// Host-side byte source for a packed blob: either a borrowed mmap slice
-enum HostBlob<'a> {
-    Borrowed(&'a [u8]),
-    Owned(Vec<u8>),
-}
-
-impl AsRef<[u8]> for HostBlob<'_> {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Borrowed(s) => s,
-            Self::Owned(v) => v,
-        }
-    }
-}
-
 /// Cumulative packed-expert sweep timings for the current model load, in ms.
 static PACKED_READ_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PACKED_UPLOAD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Verify that `names[0..n]` are uniform-`stride` tensors laid out back-to-back
-/// in file order, and return the single borrowed mmap slice covering all of
-/// them. Returns `None` on any gap, overlap, stride mismatch, dropped mmap
-/// (UMA), or attached overlay.
-fn contiguous_tensor_span<'a>(hfq: &'a HfqFile, names: &[&str], stride: usize) -> Option<&'a [u8]> {
-    if names.is_empty() || hfq.has_overlay() {
-        return None;
-    }
-    let first = hfq.find_tensor_info(names[0])?;
-    let mut expect = first.data_offset;
-    for name in names {
-        let info = hfq.find_tensor_info(name)?;
-        if info.data_offset != expect || info.data_size != stride {
-            return None;
-        }
-        expect = info.data_offset.checked_add(info.data_size)?;
-    }
-    hfq.data_range(first.data_offset, expect - first.data_offset)
-}
 
 /// Pack a uniform routed-expert layer into two allocations while preserving
 /// one `WeightTensor` view and one device pointer-table entry per expert.
@@ -5350,29 +5253,11 @@ fn try_load_packed_experts(
             down_name: expert.down_name,
         })
         .collect();
-    // Zero-copy fast path: when every expert's tensor lies contiguous in-file
-    // (expert 0's gate_up ends exactly where expert 1's begins, etc.) and the
-    // mmap is alive (dGPU, no overlay), upload both blobs straight from the
-    // page cache — no pread staging Vec, no heap copy. Measured dominant cost
-    // of A3B MoE loads otherwise: 512 pread segments per blob into a fresh
-    // heap buffer, then a second copy into hipMalloc'd VRAM.
-    let gate_up_names: Vec<&str> = specs.iter().map(|s| s.gate_up_name.as_str()).collect();
-    let down_names: Vec<&str> = specs.iter().map(|s| s.down_name.as_str()).collect();
-    let gate_up_contig = contiguous_tensor_span(hfq, &gate_up_names, gate_up_stride);
-    let down_contig = contiguous_tensor_span(hfq, &down_names, down_stride);
-
     let t_read = Instant::now();
-    // Zero-copy only pays when pages are resident: a borrowed-slice H2D from
-    // an evicted cache soft-faults serially inside the copy loop (~0.25 GB/s
-    // off disk), while the parallel-pread fallback reads with multiple lanes.
-    let zero_copy_ok = matches!((gate_up_contig, down_contig), (Some(_), Some(_)))
-        && hfq.mostly_page_cached_memo();
-    let (gate_up_host, down_host) = if zero_copy_ok {
-        let (Some(gu), Some(dn)) = (gate_up_contig, down_contig) else {
-            unreachable!("zero_copy_ok implies both spans resolved");
-        };
-        (HostBlob::Borrowed(gu), HostBlob::Borrowed(dn))
-    } else if hfq.has_overlay() {
+    // One positioned read of each expert byte into the buffer the upload
+    // copies. Overlay tensors live in a second file, so that case stays
+    // serial. Every other file uses the parallel read.
+    let (gate_up_host, down_host) = if hfq.has_overlay() {
         // Overlay offsets belong to a second file; retain the overlay-aware
         // serial path exactly rather than crossing files in reader workers.
         let mut gate_up_host = vec![0u8; gate_up_stride * specs.len()];
@@ -5418,7 +5303,7 @@ fn try_load_packed_experts(
                 down_host[slot * down_stride..(slot + 1) * down_stride].copy_from_slice(&bytes);
             }
         }
-        (HostBlob::Owned(gate_up_host), HostBlob::Owned(down_host))
+        (gate_up_host, down_host)
     } else {
         let jobs = [
             HfqReadJob::packed(
@@ -5438,14 +5323,14 @@ fn try_load_packed_experts(
             .map_err(|e| HipError::new(0, &format!("qwen35: parallel packed expert read: {e}")))?
             .into_iter();
         (
-            HostBlob::Owned(results.next().expect("two packed expert jobs").data),
-            HostBlob::Owned(results.next().expect("two packed expert jobs").data),
+            results.next().expect("two packed expert jobs").data,
+            results.next().expect("two packed expert jobs").data,
         )
     };
     if down_dtype == DType::MQ4G128V2 {
         // qt53 down: exact per-expert extent and finite fp16 headers before
         // any upload (the packed slices bypass `load_weight_tensor_raw`).
-        let down_all = down_host.as_ref();
+        let down_all = down_host.as_slice();
         for (slot, spec) in specs.iter().enumerate() {
             let blob = down_all
                 .get(slot * down_stride..(slot + 1) * down_stride)
@@ -5464,8 +5349,6 @@ fn try_load_packed_experts(
         }
     }
     let trace = hipfire_config::developer_var_os("HIPFIRE_LOAD_TRACE").is_some();
-    let zero_copy =
-        matches!(gate_up_host, HostBlob::Borrowed(_)) && matches!(down_host, HostBlob::Borrowed(_));
     let t_upload = Instant::now();
 
     let upload = |gpu: &mut Gpu, bytes: &[u8], shape: &[usize]| match target {
@@ -5475,9 +5358,9 @@ fn try_load_packed_experts(
         // `HOST_TAIL_PAD_BYTES` each (see the caller's packing refusal).
         MemoryTarget::HostMapped => gpu.upload_raw_host_mapped(bytes, shape),
     };
-    let gate_up_owner = upload(gpu, gate_up_host.as_ref(), &[specs.len(), gate_up_stride])?;
+    let gate_up_owner = upload(gpu, gate_up_host.as_slice(), &[specs.len(), gate_up_stride])?;
     drop(gate_up_host);
-    let down_owner = match upload(gpu, down_host.as_ref(), &[specs.len(), down_stride]) {
+    let down_owner = match upload(gpu, down_host.as_slice(), &[specs.len(), down_stride]) {
         Ok(owner) => owner,
         Err(error) => {
             let _ = gpu.free_tensor(gate_up_owner);
@@ -5490,9 +5373,7 @@ fn try_load_packed_experts(
     PACKED_READ_MS.fetch_add(read_ms, Ordering::Relaxed);
     PACKED_UPLOAD_MS.fetch_add(upload_ms, Ordering::Relaxed);
     if trace {
-        eprintln!(
-            "  [load-trace] packed experts: host-read {read_ms} ms, H2D {upload_ms} ms, zero-copy={zero_copy}"
-        );
+        eprintln!("  [load-trace] packed experts: host-read {read_ms} ms, H2D {upload_ms} ms");
     }
 
     let mut experts = Vec::with_capacity(specs.len());
