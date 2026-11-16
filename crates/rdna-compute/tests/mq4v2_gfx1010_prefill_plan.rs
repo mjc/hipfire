@@ -3,7 +3,8 @@
 // A 256-row chunk whose weight row fits in LDS is one tiled launch.
 // A shorter leftover is ceil(rows/4) launches of the 4-row x-batch GEMV.
 use rdna_compute::gemm::{
-    mq4v2_gfx1010_prefill_tiled, MQ4V2_GFX1010_PREFILL_LDS_MAX, MQ4V2_GFX1010_PREFILL_TILE,
+    mq4v2_gfx1010_prefill_tiled, MQ4V2_GFX1010_PREFILL_LDS_MAX, MQ4V2_GFX1010_PREFILL_ROWS,
+    MQ4V2_GFX1010_PREFILL_TILE,
 };
 
 const GROUP_BYTES: usize = 136;
@@ -24,6 +25,8 @@ fn launches(k: usize, batch: usize) -> usize {
 fn tile_matches_the_gfx1010_chunk() {
     assert_eq!(MQ4V2_GFX1010_PREFILL_TILE, 256);
     assert_eq!(MQ4V2_GFX1010_PREFILL_LDS_MAX, 8 * 1024);
+    // HIPFIRE_MQ4G256V2_PREFILL_ROWS in the HIP source. One wave per row.
+    assert_eq!(MQ4V2_GFX1010_PREFILL_ROWS, 8);
 }
 
 #[test]

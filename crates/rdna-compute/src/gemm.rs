@@ -56,11 +56,17 @@ pub fn q8_0_batched_chunks(n: usize) -> impl Iterator<Item = (usize, usize)> {
 /// A shorter call stays on the 4-row x-batch GEMV.
 pub const MQ4V2_GFX1010_PREFILL_TILE: usize = 256;
 
-/// Dynamic LDS for one staged MQ4G256V2 weight row. Eight waves on gfx1010
-/// share 64 KiB, so 8 KiB keeps `__launch_bounds__(32, 8)` honest. A heavier
-/// row stays on the 4-row x-batch GEMV. Qwen 3.5 9B hidden K=4096 is 2176 B
+/// Weight-row cap for the gfx1010 MQ4G256V2 tiled prefill. A heavier row
+/// stays on the 4-row x-batch GEMV. The tiled kernel does not stage that
+/// row: one workgroup shares a 4-token K-group of activations (4096 B) and
+/// reads each weight group from global. Qwen 3.5 9B hidden K=4096 is 2176 B
 /// and intermediate K=12288 is 6528 B, both under this cap.
 pub const MQ4V2_GFX1010_PREFILL_LDS_MAX: usize = 8 * 1024;
+
+/// Output rows in one gfx1010 MQ4G256V2 prefill workgroup. One wave per row.
+/// Matches `HIPFIRE_MQ4G256V2_PREFILL_ROWS` in the HIP source. Eight is the
+/// wave count the previous one-wave launch asked to keep resident.
+pub const MQ4V2_GFX1010_PREFILL_ROWS: usize = 8;
 
 /// One tiled gfx1010 launch, rather than chunks of 4, when `batch` is at
 /// least [`MQ4V2_GFX1010_PREFILL_TILE`], `k` is a multiple of 256, and the
@@ -43111,7 +43117,7 @@ impl Gpu {
     }
 
     /// MQ4G256V2 without WMMA. On exact gfx1010 a full chunk whose weight
-    /// row fits in LDS is one tiled launch ([`Self::gemm_mq4g256v2_prefill_gfx1010`]).
+    /// row is under the prefill cap is one tiled launch ([`Self::gemm_mq4g256v2_prefill_gfx1010`]).
     /// Every other call is the x-batched scalar GEMV, up to four input rows
     /// per launch, with that kernel's per-row accumulation order. `residual`
     /// selects `Y += W·X` over `Y = W·X`.
@@ -43217,9 +43223,11 @@ impl Gpu {
         Ok(())
     }
 
-    /// One gfx1010 launch of the LDS-staged MQ4G256V2 prefill kernel over
-    /// every activation row. The inner kernel still accumulates four rows
-    /// at a time, in the scalar GEMV's term order. `residual` selects
+    /// One gfx1010 launch of the MQ4G256V2 prefill kernel over every
+    /// activation row. Each workgroup owns [`MQ4V2_GFX1010_PREFILL_ROWS`]
+    /// output rows and stages one K-group of the current four activation
+    /// rows for all of them. Each wave still accumulates four activation
+    /// rows at a time, in the scalar GEMV's term order. `residual` selects
     /// `Y += W·X`.
     #[allow(clippy::too_many_arguments)]
     fn gemm_mq4g256v2_prefill_gfx1010(
@@ -43250,7 +43258,7 @@ impl Gpu {
         let row_bytes = k / 256 * crate::dispatch::MQ4V2_GROUP_BYTES;
         assert!(
             row_bytes <= MQ4V2_GFX1010_PREFILL_LDS_MAX,
-            "{func}: weight row {row_bytes} B exceeds the LDS cap"
+            "{func}: weight row {row_bytes} B exceeds the gfx1010 prefill cap"
         );
         self.bind_thread()?;
         self.ensure_kernel(func, source, func)?;
@@ -43260,6 +43268,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let b_val = batch_size as i32;
+        let grid_x = m.div_ceil(MQ4V2_GFX1010_PREFILL_ROWS) as u32;
         let mut params: Vec<*mut c_void> = vec![
             &a_ptr as *const _ as *mut c_void,
             &x_ptr as *const _ as *mut c_void,
@@ -43268,11 +43277,12 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
             &b_val as *const _ as *mut c_void,
         ];
+        // LDS for the activation tile is static in the HIP source.
         self.launch_maybe_blob(
             func,
-            [m as u32, 1, 1],
-            [32, 1, 1],
-            row_bytes as u32,
+            [grid_x, 1, 1],
+            [32, MQ4V2_GFX1010_PREFILL_ROWS as u32, 1],
+            0,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
