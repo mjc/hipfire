@@ -164,6 +164,13 @@ fn arch_always_passes_on_all_archs() {
 }
 
 #[test]
+fn lloyd_residual_admits_gfx1010_and_wmma_but_not_rdna2() {
+    assert!(ArchPredicate::HasWmmaOrGfx1010.eval_arch(&ctx_rdna1()));
+    assert!(!ArchPredicate::HasWmmaOrGfx1010.eval_arch(&ctx_rdna2()));
+    assert!(ArchPredicate::HasWmmaOrGfx1010.eval_arch(&ctx_rdna3()));
+}
+
+#[test]
 fn arch_has_wmma_requires_rdna3_or_rdna4() {
     assert!(!ArchPredicate::HasWmma.eval_arch(&ctx_rdna1()));
     assert!(!ArchPredicate::HasWmma.eval_arch(&ctx_rdna2()));

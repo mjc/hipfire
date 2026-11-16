@@ -667,7 +667,11 @@ impl GemmFamily {
                 hip!(gpu.gemm_hfp4g32_residual(w.buf, x, y, m, k, batch_size))
             }
             K::GemmMq3G256LloydResidual => {
-                hip!(gpu.gemm_mq3g256_lloyd_residual_wmma(w.buf, x, y, m, k, batch_size))
+                if gpu.arch_caps.is_gfx1010() {
+                    hip!(gpu.gemm_mq3_lloyd_gfx1010(w.buf, x, y, m, k, batch_size, true))
+                } else {
+                    hip!(gpu.gemm_mq3g256_lloyd_residual_wmma(w.buf, x, y, m, k, batch_size))
+                }
             }
             // #397 Ship 5.3: spec-decode (DFlash) batched lm_head catalog. Each
             // arm maps the explicit key to the exact rdna-compute method the prior
