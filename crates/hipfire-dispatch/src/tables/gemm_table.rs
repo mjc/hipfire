@@ -379,13 +379,12 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
-    // MQ4G256V2 (qt44) GEMM keys are WMMA-only (dedicated WMMA sources for
-    // gfx11 wave32 and gfx12). Admit on HasWmma (gfx1100/1101/1102/1150/1151
-    // + gfx1200/1201) via the arch-aware residual/plain wrappers; non-WMMA
-    // arches have no scalar V2 source and must not be admitted. The other
-    // V2 widths (MQ6/5/3/2V2) and MQ4CG256 remain gfx12-only until their
-    // gfx11 WMMA siblings land. Cross-RDNA scalar decode lives in fused/GEMV
-    // families, not here.
+    // MQ4G256V2 (qt44) plain and residual GEMM keys admit HasWmma plus exact
+    // gfx1010. gfx1010 has no WMMA source; the fused wrappers call
+    // `gemm_mq4g256v2`, which uses the tiled chunk kernel for a full prefill
+    // chunk and the scalar x-batch GEMV for a shorter leftover. The other V2
+    // widths stay HasWmma. Exact-verify and batched-lmhead keys stay on
+    // their narrower predicates. MQ4CG256 remains gfx12-only.
     registry.register(KernelVariant {
         key: KernelKey::GemmMq6G256V2,
         arch_required: ArchPredicate::HasWmma,
@@ -404,7 +403,7 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmMq4G256V2,
-        arch_required: ArchPredicate::HasWmma,
+        arch_required: ArchPredicate::HasWmmaOrMq4V2Gfx1010,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
@@ -444,7 +443,7 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmMq4G256V2Residual,
-        arch_required: ArchPredicate::HasWmma,
+        arch_required: ArchPredicate::HasWmmaOrMq4V2Gfx1010,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,

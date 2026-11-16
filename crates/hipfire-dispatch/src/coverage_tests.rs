@@ -1925,6 +1925,21 @@ fn mqv2_fused_and_gemm_keys_resolve_on_gfx11_gfx12() {
             }
         }
     }
+    let gfx1010 = DispatchCtx::for_test("gfx1010");
+    for key in [KernelKey::GemmMq4G256V2, KernelKey::GemmMq4G256V2Residual] {
+        if gemm.registry().resolve(key, &gfx1010, None).is_err() {
+            failures.push(format!("  gemm {:?} dead-gated on gfx1010", key));
+        }
+    }
+    for key in [
+        KernelKey::GemmMq4G256V2BatchedLmhead,
+        KernelKey::GemmMq6G256V2,
+        KernelKey::GemmMq6G256V2Residual,
+    ] {
+        if gemm.registry().resolve(key, &gfx1010, None).is_ok() {
+            failures.push(format!("  gemm {:?} must stay closed on gfx1010", key));
+        }
+    }
 
     // Also pin GemmFamily dtype→key selection for uniform V2 prefill.
     for (dtype, want) in [
@@ -1945,6 +1960,19 @@ fn mqv2_fused_and_gemm_keys_resolve_on_gfx11_gfx12() {
                 )),
             }
         }
+    }
+    match gemm.resolve(MQ4G256V2, &gfx1010, None) {
+        Ok(v) if v.key == KernelKey::GemmMq4G256V2 => {}
+        Ok(v) => failures.push(format!(
+            "  GemmFamily::resolve(MQ4G256V2, gfx1010) key {:?} ≠ GemmMq4G256V2",
+            v.key
+        )),
+        Err(e) => failures.push(format!(
+            "  GemmFamily::resolve(MQ4G256V2, gfx1010) Err({e:?})"
+        )),
+    }
+    if gemm.resolve(MQ6G256V2, &gfx1010, None).is_ok() {
+        failures.push("  GemmFamily::resolve(MQ6G256V2, gfx1010) must stay closed".into());
     }
 
     assert!(
