@@ -62,8 +62,11 @@ pub(crate) fn render_session_prompt(
     };
     let render_err =
         |e: String| DecideError::new(422, format!("messages: chat template render failed: {e}"));
+    // The chat path projects `[TOOL_CALLS]` history through `render_history`.
+    // The generic shape omits `function` and `id`, so this probe raises
+    // before the cached-history lookup on a Mistral template.
     let cold_text = frame
-        .render_messages(&msgs, tools, None)
+        .render_history(&msgs, tools, None)
         .map_err(render_err)?;
     if hipfire_engine::emit::render_tail_opens_think(&cold_text) {
         return Err(DecideError::new(
@@ -87,8 +90,14 @@ pub(crate) fn render_session_prompt(
     } else {
         primer
     };
+    let include_call_ids = template.contains("[TOOL_CALLS]");
     build_cached_history_jinja(&frame, &msgs, tools, |msg| {
-        crate::qwen::qwen_jinja_lookup_turn(&mut *asst_turn_cache, msg, &primer)
+        crate::qwen::qwen_jinja_lookup_turn_for(
+            &mut *asst_turn_cache,
+            msg,
+            &primer,
+            include_call_ids,
+        )
     })
     .map_err(render_err)
 }
@@ -859,5 +868,48 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.status, 422);
         assert!(e.message.contains("messages"), "{}", e.message);
+    }
+
+    /// Mistral v3 reads `tool_call.function` and raises when `id` is missing.
+    /// The session probe has to use the same projection as chat, or a llama
+    /// decide request 422s before the cached-history lookup.
+    #[test]
+    fn llama_session_renders_the_call_the_client_sent() {
+        const TEMPLATE: &str = "{%- for message in messages %}{%- if message.tool_calls %}{{- '[TOOL_CALLS] [' }}{%- for tool_call in message.tool_calls %}{%- set out = tool_call.function|tojson %}{{- out[:-1] }}{%- if not tool_call.id is defined or tool_call.id|length < 9 %}{{- raise_exception('Tool call IDs should be alphanumeric strings with length >= 9!') }}{%- endif %}{{- ', \"id\": \"' + tool_call.id[-9:] + '\"}' }}{%- if not loop.last %}{{- ', ' }}{%- endif %}{%- endfor %}{{- ']' }}{%- elif message.role == 'assistant' %}{{- message.content + eos_token }}{%- else %}{{- message.content }}{%- endif %}{%- endfor %}";
+        let history = vec![
+            serde_json::from_value(json!({
+                "role": "user",
+                "content": "weather?"
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "abc123xyz",
+                    "name": "get_weather",
+                    "arguments": {"city": "SF"}
+                }]
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "role": "tool",
+                "content": "72F",
+                "tool_call_id": "abc123xyz"
+            }))
+            .unwrap(),
+        ];
+        let t = tok();
+        let mut cache = AsstTurnCache::new_from_env();
+        let rendered = render_session_prompt(&t, TEMPLATE, &mut cache, &history, None, "next?")
+            .unwrap_or_else(|e| panic!("session render failed: {e:?}"));
+        let text = t.decode(&rendered);
+        assert!(
+            text.contains("[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"SF\"}, \"id\": \"abc123xyz\"}]"),
+            "{text}"
+        );
+        assert!(text.contains("72F"), "{text}");
+        assert!(text.contains("next?"), "{text}");
+        assert!(!text.contains("nul"), "{text}");
     }
 }

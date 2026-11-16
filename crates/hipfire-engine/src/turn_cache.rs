@@ -18,6 +18,21 @@ use hipfire_runtime::prompt_frame::ToolCall;
 /// emitted token IDs verbatim instead of re-encoding via the DSML
 /// renderer + BPE (which is not bijective)."
 pub fn asst_turn_fingerprint(content: &str, tool_calls: &[ToolCall]) -> u64 {
+    asst_turn_fingerprint_for(content, tool_calls, false)
+}
+
+/// [`asst_turn_fingerprint`] plus each call id when `include_call_ids` is set.
+///
+/// A `[TOOL_CALLS]` body contains the id, so two calls that share a name and
+/// arguments still need different keys. A Qwen XML body does not contain the
+/// id the client echoes (`call_N` is assigned on the wire). Those stores and
+/// lookups pass false, and the key stays the historical one. A missing id
+/// hashes as an empty string.
+pub fn asst_turn_fingerprint_for(
+    content: &str,
+    tool_calls: &[ToolCall],
+    include_call_ids: bool,
+) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
@@ -50,6 +65,9 @@ pub fn asst_turn_fingerprint(content: &str, tool_calls: &[ToolCall]) -> u64 {
     }
     for tc in tool_calls {
         tc.name.hash(&mut h);
+        if include_call_ids {
+            tc.id.as_deref().unwrap_or("").hash(&mut h);
+        }
         // Serialize args in a CANONICAL form: walk the Value tree and
         // emit objects with keys sorted lexically (recursively). The
         // upstream `serde_json::Map` uses insertion order — fine for
@@ -87,9 +105,22 @@ impl TurnCacheAction {
 /// Publish `cached_seq` through `insert` (production `AsstTurnCache` or a
 /// test map). Returns the fingerprint key when a store happened.
 pub fn apply_turn_cache_action<F>(
+    insert: F,
+    action: &TurnCacheAction,
+    cached_seq: Vec<u32>,
+) -> Option<u64>
+where
+    F: FnMut(u64, Vec<u32>),
+{
+    apply_turn_cache_action_for(insert, action, cached_seq, false)
+}
+
+/// [`apply_turn_cache_action`] with [`asst_turn_fingerprint_for`]'s id flag.
+pub fn apply_turn_cache_action_for<F>(
     mut insert: F,
     action: &TurnCacheAction,
     cached_seq: Vec<u32>,
+    include_call_ids: bool,
 ) -> Option<u64>
 where
     F: FnMut(u64, Vec<u32>),
@@ -97,7 +128,11 @@ where
     if !action.store || cached_seq.is_empty() {
         return None;
     }
-    let fp = asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls);
+    let fp = asst_turn_fingerprint_for(
+        &action.fingerprint_text,
+        &action.tool_calls,
+        include_call_ids,
+    );
     insert(fp, cached_seq);
     Some(fp)
 }
