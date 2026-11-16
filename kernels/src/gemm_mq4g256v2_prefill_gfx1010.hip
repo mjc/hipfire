@@ -31,6 +31,12 @@
 #define HIPFIRE_MQ4G256V2_PREFILL_THREADS \
     (HIPFIRE_MQ4G256V2_PREFILL_ROWS * 32)
 
+// __syncthreads() also emits buffer_gl0_inv. The waves only exchange the
+// activation tile through LDS, so wait for that traffic and barrier.
+__device__ __forceinline__ void mq4v2_lds_barrier() {
+    asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)\n\ts_barrier" ::: "memory");
+}
+
 // Fill xtile with x[b, g*256 : g*256+256) for the live tokens, then add this
 // group's eight nibble terms into acc[0..local_b). Every thread in the
 // workgroup runs both barriers. g_index and acc_slot are each evaluated once
@@ -63,7 +69,7 @@
             xtile[dst_ + 2] = got_.z;                                              \
             xtile[dst_ + 3] = got_.w;                                              \
         }                                                                          \
-        __syncthreads();                                                           \
+        mq4v2_lds_barrier();                                                           \
         if (active) {                                                              \
             _Pragma("unroll")                                                      \
             for (int b_ = 0; b_ < HIPFIRE_MQ4G256V2_PREFILL_STEP; b_++) {          \
@@ -80,7 +86,7 @@
                     + (sc_ * (float)((pk_ >> 28) & 0xFu) + zp_) * xb_[7];          \
             }                                                                      \
         }                                                                          \
-        __syncthreads();                                                           \
+        mq4v2_lds_barrier();                                                           \
     } while (0)
 
 __launch_bounds__(HIPFIRE_MQ4G256V2_PREFILL_THREADS, 1)
