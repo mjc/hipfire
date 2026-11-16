@@ -1080,6 +1080,8 @@ impl Rig {
                 .map(|v| v != "0")
                 .unwrap_or_else(|| gpu.is_uma()),
         );
+        let mut hfq_cache_warmer = hfq.start_cache_warmup();
+        eprintln!("  weight cache warmup: {}", hfq_cache_warmer.finish());
         // The capture gate and the CPU-exec coverage line are model-scoped: this
         // slots path loads weights directly (not through
         // `Architecture::load_weights_with_placement`), so it must set the flag,
