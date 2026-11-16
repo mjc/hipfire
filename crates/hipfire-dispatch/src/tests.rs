@@ -414,11 +414,23 @@ fn gemm_mq4v2_mq4c_keys_resolve_gfx12_only() {
             key,
             "{key:?} must resolve on gfx1100-class (HasWmma)"
         );
-        let err_rdna1 = fam.registry().resolve(key, &rdna1, None).unwrap_err();
-        assert!(
-            matches!(err_rdna1, DispatchError::MissingImpl { .. }),
-            "{key:?} must MissingImpl on gfx1010, got {err_rdna1:?}"
+        let gfx1010_xbatch = matches!(
+            key,
+            KernelKey::GemmMq4G256V2 | KernelKey::GemmMq4G256V2Residual
         );
+        if gfx1010_xbatch {
+            assert_eq!(
+                fam.registry().resolve(key, &rdna1, None).unwrap().key,
+                key,
+                "{key:?} must resolve on gfx1010 via the x-batch prefill path"
+            );
+        } else {
+            let err_rdna1 = fam.registry().resolve(key, &rdna1, None).unwrap_err();
+            assert!(
+                matches!(err_rdna1, DispatchError::MissingImpl { .. }),
+                "{key:?} must MissingImpl on gfx1010, got {err_rdna1:?}"
+            );
+        }
     }
     for &key in &mq4c_keys {
         assert!(
