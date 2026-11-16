@@ -78,7 +78,11 @@
     {%- endif %}
 {%- endif %}
 {%- if _has_tools %}
-    {{- '<|im_start|>system\n' }}
+    {%- if _sc %}
+        {{- '<|im_start|>system\n' + _sc + '\n\n' }}
+    {%- else %}
+        {{- '<|im_start|>system\n' }}
+    {%- endif %}
     {{- '# Tools\n\nYou have access to the following functions:\n\n<tools>' }}
     {%- for tool in tools %}
         {{- '\n' }}
@@ -116,9 +120,6 @@ Reminder:
 </IMPORTANT>
     {%- endset %}
     {{- '\n\n' ~ tool_instructions | trim }}
-    {%- if _sc %}
-        {{- '\n\n' + _sc }}
-    {%- endif %}
     {{- '<|im_end|>\n' }}
 {%- else %}
     {%- if _sc %}
