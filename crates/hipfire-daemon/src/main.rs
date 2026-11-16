@@ -804,6 +804,72 @@ fn no_model_loaded_suffix(model_present: bool) -> &'static str {
     }
 }
 
+/// A single-device resident load of one weight file bigger than the device
+/// cannot succeed. The check runs before unload, so a model already loaded
+/// stays loaded. Pipeline and expert loads split the file across devices. A
+/// configured spill can place layers in host memory. `device_total == 0`
+/// means the device size was not queried.
+fn resident_weight_file_refusal(
+    file_len: u64,
+    device_total: u64,
+    single_device: bool,
+    spill_requested: bool,
+) -> Option<String> {
+    if !single_device || spill_requested || device_total == 0 || file_len <= device_total {
+        return None;
+    }
+    let file_mb = file_len / (1024 * 1024);
+    let device_mb = device_total / (1024 * 1024);
+    Some(format!(
+        "load refused: weight file is {file_mb} MB and this GPU has {device_mb} MB. \
+         The file is larger than the card, so this load was not started"
+    ))
+}
+
+fn single_device_weight_file_refusal(
+    path: &str,
+    gpu: &rdna_compute::Gpu,
+    load_tp: usize,
+    pp: usize,
+) -> Option<String> {
+    if load_tp > 1 || pp > 1 {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let (_, total) = gpu.device_mem_info().ok()?;
+    resident_weight_file_refusal(
+        meta.len(),
+        total as u64,
+        true,
+        hipfire_config::memory::spill_requested(),
+    )
+}
+
+/// Carrier rollback of an unload-first load parks device buffers in the pool.
+/// The next weight upload allocates with `hipMalloc` and does not drain that
+/// pool, so a failed switch leaves the card full for every later model.
+/// Return the parked bytes before reporting the error.
+fn reclaim_abandoned_device_memory(gpu: &mut rdna_compute::Gpu) {
+    gpu.invalidate_weight_caches();
+    gpu.invalidate_graph_state();
+    let parked = gpu.pool_parked_bytes();
+    gpu.drain_pool();
+    if let Err(err) = gpu.ensure_vmm_cleaned() {
+        eprintln!("load failed: VMM cleanup after abandoned device memory: {err}");
+    }
+    if parked > 0 {
+        let (free, total) = gpu.device_mem_info().unwrap_or((0, 0));
+        eprintln!(
+            "load failed with no model resident; returned {parked} B of pooled device memory (free {} MB / {} MB)",
+            free / (1024 * 1024),
+            total / (1024 * 1024),
+        );
+    }
+}
+
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
 /// the panic shape we used to emit (which dumped a Rust backtrace and the
 /// raw HipError debug-format) but turns it into a concrete next-step list.
@@ -2467,6 +2533,19 @@ fn main() {
                     admission.kv_backend_reason.as_deref(),
                 );
 
+                if let Some(refusal) = single_device_weight_file_refusal(path, &gpu, load_tp, pp) {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        &refusal,
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
                 // it -- otherwise free_tensor would queue them into the
@@ -3108,6 +3187,12 @@ fn main() {
                         batch_poisoned = None;
                     }
                     Err(e) => {
+                        // Unload-first already dropped the prior model. Drain
+                        // before reading free VRAM so the reported figure and
+                        // the next load both see the reclaimed card.
+                        if model.is_none() {
+                            reclaim_abandoned_device_memory(&mut gpu);
+                        }
                         let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                         let free_mb = vram_free / (1024 * 1024);
                         let total_mb = vram_total / (1024 * 1024);
@@ -5247,6 +5332,32 @@ mod tests {
         assert!(super::no_model_loaded_suffix(false).contains("no model loaded"));
         // Deferred tp>1: prior model survives a failed load.
         assert_eq!(super::no_model_loaded_suffix(true), "");
+    }
+
+    #[test]
+    fn oversized_weight_file_is_refused_before_a_single_device_unload() {
+        // 8501 MiB file, 8176 MiB device: the file alone cannot be resident.
+        let file_len = 8_914_591_328u64;
+        let device_total = 8_573_157_376u64;
+        let msg = super::resident_weight_file_refusal(file_len, device_total, true, false)
+            .expect("file larger than the device");
+        assert!(msg.contains("load refused"));
+        assert!(msg.contains("8501 MB"));
+        assert!(msg.contains("8176 MB"));
+        assert!(msg.contains("was not started"));
+        assert!(
+            super::resident_weight_file_refusal(device_total, device_total, true, false).is_none()
+        );
+        assert!(
+            super::resident_weight_file_refusal(device_total - 1, device_total, true, false)
+                .is_none()
+        );
+        // A split load or a configured host spill is not this gate.
+        assert!(
+            super::resident_weight_file_refusal(file_len, device_total, false, false).is_none()
+        );
+        assert!(super::resident_weight_file_refusal(file_len, device_total, true, true).is_none());
+        assert!(super::resident_weight_file_refusal(file_len, 0, true, false).is_none());
     }
 
     use super::{
