@@ -11242,7 +11242,8 @@ fn load_qwen35_pp(
             .map(|v| v != "0")
             .unwrap_or_else(|| gpus.devices.iter().any(|g| g.is_uma())),
     );
-    let _hfq_cache_warmer = hfq_file.start_cache_warmup();
+    let mut hfq_cache_warmer = hfq_file.start_cache_warmup();
+    eprintln!("  weight cache warmup: {}", hfq_cache_warmer.finish());
     let layout = hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_source = hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq_file, &config);
     let weights =
@@ -11569,7 +11570,8 @@ impl Carrier for Qwen35Carrier {
                         .map(|v| v != "0")
                         .unwrap_or_else(|| ctx.gpu.is_uma()),
                 );
-                let _hfq_cache_warmer = hfq_file.start_cache_warmup();
+                let mut hfq_cache_warmer = hfq_file.start_cache_warmup();
+                eprintln!("  weight cache warmup: {}", hfq_cache_warmer.finish());
 
                 // ── pp=1 path (single-GPU) ────────────────────
 
@@ -12192,6 +12194,25 @@ impl Carrier for LlamaCarrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
+
+        // Same page-cache rule as Qwen 3.5. Llama copies each tensor with
+        // pread, and eviction then drops that range, so a cold load is one
+        // serial pass. A discrete GPU warms the file first. UMA keeps
+        // eviction and skips the warmer.
+        let (src, _hfq_cache_warmer) = match src {
+            ModelSource::Hfq(mut hfq_file) => {
+                hfq_file.set_evict_page_cache(
+                    hipfire_config::developer_var("HIPFIRE_PAGE_EVICTION")
+                        .ok()
+                        .map(|v| v != "0")
+                        .unwrap_or_else(|| ctx.gpu.is_uma()),
+                );
+                let mut hfq_cache_warmer = hfq_file.start_cache_warmup();
+                eprintln!("  weight cache warmup: {}", hfq_cache_warmer.finish());
+                (ModelSource::Hfq(hfq_file), Some(hfq_cache_warmer))
+            }
+            other => (other, None),
+        };
 
         let mut bundle = hipfire_arch_llama::load_llama_bundle(src, ctx)?;
 
