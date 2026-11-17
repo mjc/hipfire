@@ -2602,6 +2602,8 @@ struct VmmLaneCtl {
     /// prompt prefill snapshots at its newest chunk end at or before it, so a
     /// follow-up user turn resumes from there. A chunk from position 0 that
     /// contains the boundary is shortened to it, matching the singleton.
+    /// Checkpoint resume off leaves this unset, so that chunk keeps the exact
+    /// route's length.
     turn: hipfire_arch_qwen35::speculative::TurnCheckpoint,
     /// Verbatim assistant turn stored when the client commits.
     turn_store: Option<(TurnCacheAction, Vec<u32>)>,
@@ -4549,7 +4551,10 @@ pub fn drive_qwen_vmm_continuous_batch(
                 prefill_tokens: rendered.len() - start,
                 decode_start: rendered.len(),
                 turn: hipfire_arch_qwen35::speculative::TurnCheckpoint {
-                    boundary: turn_boundary,
+                    boundary: hipfire_runtime::prompt_frame::turn_boundary_when_resume(
+                        turn_boundary,
+                        crate::ar::ckpt_resume_enabled(),
+                    ),
                     pin: None,
                 },
                 ..VmmLaneCtl::default()
@@ -4922,7 +4927,9 @@ pub fn drive_qwen_vmm_continuous_batch(
         planner.forced_prefill_len = match forced {
             Ok(mut lengths) => {
                 // Same cut as the singleton: a lane chunk from position 0
-                // that holds the user-turn boundary stops on that boundary.
+                // that holds the stored user-turn boundary stops on that
+                // boundary. Resume off stores no boundary, so this length
+                // stays the exact route's own chunk.
                 if let Some(store) = vmm_bundle(&mut model.state).and_then(|b| b.vmm_store.as_ref())
                 {
                     for (i, len) in lengths.iter_mut().enumerate() {

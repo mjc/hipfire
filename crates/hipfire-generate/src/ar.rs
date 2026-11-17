@@ -5143,7 +5143,10 @@ pub fn generate(
         // position 0 that contains the boundary stops on it: a snapshot at 0
         // is discarded, and the re-send then has a checkpoint to replay from.
         let mut turn = speculative::TurnCheckpoint {
-            boundary: turn_boundary.filter(|_| ckpt_resume_enabled()),
+            boundary: hipfire_runtime::prompt_frame::turn_boundary_when_resume(
+                turn_boundary,
+                ckpt_resume_enabled(),
+            ),
             pin: m.user_turn_ckpt,
         };
         let mut prefill_aborted = false;

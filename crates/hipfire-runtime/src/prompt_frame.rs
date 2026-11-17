@@ -1688,6 +1688,14 @@ pub fn leading_chunk_cut_at_boundary(
     chunk_holds_turn_boundary(0, len, Some(boundary)).then_some(boundary)
 }
 
+/// User-turn boundary stored for the opening-chunk cut.
+///
+/// Checkpoint resume off leaves it unset, so both routes keep the chunk
+/// length the planner already chose.
+pub fn turn_boundary_when_resume(boundary: Option<usize>, resume_enabled: bool) -> Option<usize> {
+    boundary.filter(|_| resume_enabled)
+}
+
 /// Does this template already emit `primer` at the head of a HISTORY
 /// assistant turn?
 ///
@@ -5305,5 +5313,18 @@ SYS:{{ build_system_message(system_message) }}:END
         assert_eq!(leading_chunk_cut_at_boundary(0, 100, None), None);
         assert_eq!(leading_chunk_cut_at_boundary(256, 256, Some(400)), None);
         assert_eq!(leading_chunk_cut_at_boundary(768, 44, Some(800)), None);
+    }
+
+    #[test]
+    fn resume_off_keeps_the_opening_chunk_whole() {
+        // Boundary 43 sits inside a 100-token chunk from 0. Resume off stores
+        // no boundary, so that chunk stays 100. Resume on still cuts at 43.
+        let raw = Some(43usize);
+        let disabled = turn_boundary_when_resume(raw, false);
+        assert_eq!(disabled, None);
+        assert_eq!(leading_chunk_cut_at_boundary(0, 100, disabled), None);
+        let enabled = turn_boundary_when_resume(raw, true);
+        assert_eq!(enabled, Some(43));
+        assert_eq!(leading_chunk_cut_at_boundary(0, 100, enabled), Some(43));
     }
 }
