@@ -1729,11 +1729,46 @@ pub fn user_turn_resume_boundary(
 /// Whether the prefill chunk `[pos, pos + len)` holds the user-turn `boundary`.
 /// Checked before forwarding each chunk: `pos` is then the newest existing
 /// chunk end at or before the boundary (or the prefill's start), which is where
-/// the user-turn snapshot is taken. The chunk plan itself is never changed, so
-/// the snapshot only copies state and the prefill's numerics stay untouched
-/// (an added chunk boundary moves the logits of long prompts).
+/// the user-turn snapshot is taken. Callers leave a chunk that already starts
+/// after position 0 unchanged, so a long prompt keeps its requant cadence.
 pub fn chunk_holds_turn_boundary(pos: usize, len: usize, boundary: Option<usize>) -> bool {
     matches!(boundary, Some(b) if pos <= b && b < pos + len)
+}
+
+/// Length to forward before a user-turn snapshot when this chunk starts at
+/// position 0 and `boundary` sits strictly inside it.
+///
+/// A snapshot at position 0 is discarded, so a one-chunk prompt otherwise
+/// keeps only a checkpoint at its end, and a re-send of that prompt has
+/// nothing to replay. Returning the boundary makes the next chunk start
+/// there. A chunk that already starts after 0 is not cut: its start is a
+/// usable snapshot.
+pub fn leading_chunk_cut_at_boundary(
+    pos: usize,
+    len: usize,
+    boundary: Option<usize>,
+) -> Option<usize> {
+    if pos != 0 {
+        return None;
+    }
+    let boundary = boundary.filter(|b| *b > 0)?;
+    chunk_holds_turn_boundary(0, len, Some(boundary)).then_some(boundary)
+}
+
+/// User-turn boundary stored for the opening-chunk cut.
+///
+/// Checkpoint resume off leaves it unset, so both routes keep the chunk
+/// length the planner already chose.
+pub fn turn_boundary_when_resume(boundary: Option<usize>, resume_enabled: bool) -> Option<usize> {
+    boundary.filter(|_| resume_enabled)
+}
+
+/// Serve chunk length after the user-turn opening cut.
+///
+/// `ordinary` is the chunk the planner chose at `position`. The exact-route
+/// provision check accepts this length and no other.
+pub fn serve_prefill_chunk_len(ordinary: usize, position: usize, boundary: Option<usize>) -> usize {
+    leading_chunk_cut_at_boundary(position, ordinary, boundary).unwrap_or(ordinary)
 }
 
 /// Does this template already emit `primer` at the head of a HISTORY
@@ -5455,5 +5490,46 @@ SYS:{{ build_system_message(system_message) }}:END
         // Boundary behind the prefill, or none.
         assert!(!chunk_holds_turn_boundary(600, 64, Some(521)));
         assert!(!chunk_holds_turn_boundary(0, 512, None));
+    }
+
+    #[test]
+    fn one_chunk_prompt_cuts_at_the_boundary_so_a_resend_can_replay() {
+        // 100-token prompt, one chunk from 0, opener boundary at 43. The
+        // cut is the checkpoint a re-send replays from, strictly before the
+        // prompt end. A later chunk is not recut.
+        assert_eq!(leading_chunk_cut_at_boundary(0, 100, Some(43)), Some(43));
+        assert_eq!(leading_chunk_cut_at_boundary(0, 100, Some(100)), None);
+        assert_eq!(leading_chunk_cut_at_boundary(0, 100, Some(0)), None);
+        assert_eq!(leading_chunk_cut_at_boundary(0, 100, None), None);
+        assert_eq!(leading_chunk_cut_at_boundary(256, 256, Some(400)), None);
+        assert_eq!(leading_chunk_cut_at_boundary(768, 44, Some(800)), None);
+    }
+
+    #[test]
+    fn resume_off_keeps_the_opening_chunk_whole() {
+        // Boundary 43 sits inside a 100-token chunk from 0. Resume off stores
+        // no boundary, so that chunk stays 100. Resume on still cuts at 43.
+        let raw = Some(43usize);
+        let disabled = turn_boundary_when_resume(raw, false);
+        assert_eq!(disabled, None);
+        assert_eq!(leading_chunk_cut_at_boundary(0, 100, disabled), None);
+        let enabled = turn_boundary_when_resume(raw, true);
+        assert_eq!(enabled, Some(43));
+        assert_eq!(leading_chunk_cut_at_boundary(0, 100, enabled), Some(43));
+    }
+
+    #[test]
+    fn exact_route_accepts_the_boundary_cut_and_keeps_later_chunks() {
+        // A cold 100-row chunk with the boundary at 43. Provision must
+        // accept 43. The uncut 100 is a different length. The next chunk
+        // already starts at 43, so it stays 57.
+        let boundary = Some(43usize);
+        let opening = serve_prefill_chunk_len(100, 0, boundary);
+        assert_eq!(opening, 43);
+        assert_ne!(opening, 100);
+        assert_eq!(serve_prefill_chunk_len(100, 0, None), 100);
+        assert_eq!(serve_prefill_chunk_len(57, 43, boundary), 57);
+        assert_eq!(serve_prefill_chunk_len(100, 0, Some(100)), 100);
+        assert_eq!(serve_prefill_chunk_len(256, 256, Some(400)), 256);
     }
 }
