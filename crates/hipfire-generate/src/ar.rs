@@ -5291,20 +5291,18 @@ pub fn generate(
                     break;
                 }
                 let remaining = new_tokens.len() - start;
-                let mut outer =
+                let ordinary =
                     qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
                         .unwrap_or(remaining.min(chunk_max).max(1));
                 // A chunk from position 0 that contains the user-turn boundary
                 // would snapshot at 0, which is discarded. Stop this chunk on
                 // the boundary so the next one starts there and the snapshot
                 // is replayable. Later chunks keep their length.
-                if let Some(cut) = hipfire_runtime::prompt_frame::leading_chunk_cut_at_boundary(
+                let outer = hipfire_runtime::prompt_frame::serve_prefill_chunk_len(
+                    ordinary,
                     m.seq_pos,
-                    outer,
                     turn.boundary,
-                ) {
-                    outer = cut;
-                }
+                );
                 if ckpt_resume_enabled() {
                     speculative::take_turn_checkpoint_before_chunk(
                         &mut m.prefill_checkpoints,

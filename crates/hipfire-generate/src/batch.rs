@@ -4899,7 +4899,16 @@ pub fn drive_qwen_vmm_continuous_batch(
             .collect();
         // Exact route: every prefill chunk must be the singleton route's own
         // chunk for that request (DeltaNet requant cadence), so the planner
-        // takes exactly that length or nothing.
+        // takes exactly that length or nothing. The request stores the same
+        // resume-gated boundary the singleton cuts on, and the chunk length
+        // includes that opening cut. Provision recomputes this length.
+        if let Some(store) = vmm_bundle(&mut model.state).and_then(|b| b.vmm_store.as_mut()) {
+            for (i, epoch) in epochs.iter().enumerate() {
+                if let Some(st) = store.request_state_mut(epoch) {
+                    st.turn_boundary = ctl[i].turn.boundary;
+                }
+            }
+        }
         let forced = (|| -> Result<Vec<Option<usize>>, String> {
             let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
             let store = b.vmm_store.as_ref().ok_or("store not staged")?;
@@ -4925,31 +4934,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                 .collect()
         })();
         planner.forced_prefill_len = match forced {
-            Ok(mut lengths) => {
-                // Same cut as the singleton: a lane chunk from position 0
-                // that holds the stored user-turn boundary stops on that
-                // boundary. Resume off stores no boundary, so this length
-                // stays the exact route's own chunk.
-                if let Some(store) = vmm_bundle(&mut model.state).and_then(|b| b.vmm_store.as_ref())
-                {
-                    for (i, len) in lengths.iter_mut().enumerate() {
-                        let Some(len) = len else { continue };
-                        let Some(st) = store.request_state(&epochs[i]) else {
-                            continue;
-                        };
-                        if let Some(cut) =
-                            hipfire_runtime::prompt_frame::leading_chunk_cut_at_boundary(
-                                st.position,
-                                *len,
-                                ctl[i].turn.boundary,
-                            )
-                        {
-                            *len = cut;
-                        }
-                    }
-                }
-                lengths
-            }
+            Ok(lengths) => lengths,
             Err(e) => {
                 return fail_all(
                     sched,

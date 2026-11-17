@@ -1696,6 +1696,14 @@ pub fn turn_boundary_when_resume(boundary: Option<usize>, resume_enabled: bool) 
     boundary.filter(|_| resume_enabled)
 }
 
+/// Serve chunk length after the user-turn opening cut.
+///
+/// `ordinary` is the chunk the planner chose at `position`. The exact-route
+/// provision check accepts this length and no other.
+pub fn serve_prefill_chunk_len(ordinary: usize, position: usize, boundary: Option<usize>) -> usize {
+    leading_chunk_cut_at_boundary(position, ordinary, boundary).unwrap_or(ordinary)
+}
+
 /// Does this template already emit `primer` at the head of a HISTORY
 /// assistant turn?
 ///
@@ -5326,5 +5334,20 @@ SYS:{{ build_system_message(system_message) }}:END
         let enabled = turn_boundary_when_resume(raw, true);
         assert_eq!(enabled, Some(43));
         assert_eq!(leading_chunk_cut_at_boundary(0, 100, enabled), Some(43));
+    }
+
+    #[test]
+    fn exact_route_accepts_the_boundary_cut_and_keeps_later_chunks() {
+        // A cold 100-row chunk with the boundary at 43. Provision must
+        // accept 43. The uncut 100 is a different length. The next chunk
+        // already starts at 43, so it stays 57.
+        let boundary = Some(43usize);
+        let opening = serve_prefill_chunk_len(100, 0, boundary);
+        assert_eq!(opening, 43);
+        assert_ne!(opening, 100);
+        assert_eq!(serve_prefill_chunk_len(100, 0, None), 100);
+        assert_eq!(serve_prefill_chunk_len(57, 43, boundary), 57);
+        assert_eq!(serve_prefill_chunk_len(100, 0, Some(100)), 100);
+        assert_eq!(serve_prefill_chunk_len(256, 256, Some(400)), 256);
     }
 }
