@@ -150,7 +150,8 @@ impl Default for SamplerConfig {
 /// inline sequence so byte-identical token streams are preserved):
 ///
 ///  1. Upload the trailing `min(history.len(), repeat_window,
-///     repeat_buf_capacity)` tokens of `history` into `repeat_buf`.
+///     repeat_buf_capacity)` tokens of `history` into `repeat_buf`
+///     when a penalty will read them.
 ///  2. Write `-INF` to `logits` at every offset in
 ///     `cfg.blocked_tokens` (one 4-byte H2D copy each).
 ///  3. Launch `Gpu::sample_top_p` (top-K + softmax + top-p + RNG +
@@ -186,7 +187,12 @@ pub fn sample(
     let window = cfg.repeat_window.min(buf_cap_tokens);
     let scope_start = history.len().saturating_sub(window);
     let scope = &history[scope_start..];
-    if !scope.is_empty() {
+    // `sample_top_p` reads this window only when a penalty is active. A
+    // neutral repeat penalty with zero presence and frequency does not
+    // touch the logits, so the copy is skipped. Blocked tokens still write.
+    let penalties_active =
+        cfg.repeat_penalty > 1.0 || cfg.presence_penalty > 0.0 || cfg.frequency_penalty > 0.0;
+    if penalties_active && !scope.is_empty() {
         let bytes: Vec<u8> = scope.iter().flat_map(|t| t.to_ne_bytes()).collect();
         let _ = gpu.hip.memcpy_htod(&repeat_buf.buf, &bytes);
     }
