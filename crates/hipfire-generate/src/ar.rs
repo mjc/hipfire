@@ -5138,10 +5138,15 @@ pub fn generate(
         // gets control back immediately instead of waiting.
         // The newest user-turn boundary stays pinned in the checkpoint ring
         // until the next user turn; a tool-result request keeps the previous one.
-        // The snapshot sits on the newest existing chunk end at or before the
-        // boundary: the chunk plan is untouched (numerics-neutral).
+        // The snapshot sits on the newest chunk end at or before the boundary.
+        // Chunks that start after position 0 keep their length. A chunk from
+        // position 0 that contains the boundary stops on it: a snapshot at 0
+        // is discarded, and the re-send then has a checkpoint to replay from.
         let mut turn = speculative::TurnCheckpoint {
-            boundary: turn_boundary.filter(|_| ckpt_resume_enabled()),
+            boundary: hipfire_runtime::prompt_frame::turn_boundary_when_resume(
+                turn_boundary,
+                ckpt_resume_enabled(),
+            ),
             pin: m.user_turn_ckpt,
         };
         let mut prefill_aborted = false;
@@ -5286,8 +5291,18 @@ pub fn generate(
                     break;
                 }
                 let remaining = new_tokens.len() - start;
-                let outer = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
-                    .unwrap_or(remaining.min(chunk_max).max(1));
+                let ordinary =
+                    qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
+                        .unwrap_or(remaining.min(chunk_max).max(1));
+                // A chunk from position 0 that contains the user-turn boundary
+                // would snapshot at 0, which is discarded. Stop this chunk on
+                // the boundary so the next one starts there and the snapshot
+                // is replayable. Later chunks keep their length.
+                let outer = hipfire_runtime::prompt_frame::serve_prefill_chunk_len(
+                    ordinary,
+                    m.seq_pos,
+                    turn.boundary,
+                );
                 if ckpt_resume_enabled() {
                     speculative::take_turn_checkpoint_before_chunk(
                         &mut m.prefill_checkpoints,

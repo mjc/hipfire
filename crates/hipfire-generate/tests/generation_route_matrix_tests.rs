@@ -1002,6 +1002,30 @@ fn empty_lineage_is_a_local_miss() {
     assert_plan(&got, &rendered, 16, None, "EOP candidate");
 }
 
+/// A one-chunk prompt snapshots on the user-turn boundary, not at its end.
+/// Re-sending that prompt replays only the suffix after the boundary, and
+/// that suffix is the same token span an independent replay forwards there.
+#[test]
+fn repeated_short_prompt_replays_fewer_tokens_than_a_cold_render() {
+    use hipfire_generate::qwen::plan_from_rendered as plan;
+    let n = 100usize;
+    let boundary = 43usize;
+    let prompt: Vec<u32> = (0..n as u32).collect();
+    let cut = hipfire_runtime::prompt_frame::leading_chunk_cut_at_boundary(0, n, Some(boundary));
+    assert_eq!(cut, Some(boundary));
+    let repeated = plan(&prompt, prompt.clone(), true, &[boundary], true, "mq4");
+    assert!(
+        repeated.new_tokens.len() < prompt.len(),
+        "re-send prefilled {} tokens",
+        repeated.new_tokens.len()
+    );
+    assert_eq!(repeated.new_tokens, prompt[boundary..]);
+    assert_eq!(repeated.resume_from, Some(boundary));
+    // The cold render forwards the whole prompt. The resumed suffix is that
+    // render's tail, so the continuation is the same token span.
+    assert_eq!(repeated.new_tokens, &prompt[cut.unwrap()..]);
+}
+
 /// A candidate equal to the prompt length leaves no suffix to prefill, so it is
 /// never a hit: every plan keeps a nonempty `new_tokens` tail and
 /// `start_pos < rendered.len()`.

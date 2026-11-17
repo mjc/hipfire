@@ -421,6 +421,10 @@ pub struct Qwen35RequestState {
     /// Total prompt rows; the Prefill chunk ending here carries the head
     /// and commits the first generated id.
     pub prompt_len: usize,
+    /// User-turn boundary for the opening prefill chunk. Resume off leaves
+    /// it unset. While `position` is 0 and the boundary sits inside the
+    /// ordinary chunk, the exact route stops that chunk there.
+    pub turn_boundary: Option<usize>,
     /// Request-local GatedDeltaNet stochastic-rounding frame (used only
     /// when error feedback is off; the exact route swaps it in around this
     /// request's recurrence so its frame sequence is its own).
@@ -538,6 +542,7 @@ impl Qwen35RequestState {
             gdn_frame: rdna_compute::norm::gdn_requant_frame_checkpoint(),
             poisoned: false,
             prompt_len: init.prompt_len,
+            turn_boundary: None,
             stop_ids: init.stop_ids,
             sampler: init.sampler,
             rng_state: init.rng_state,
@@ -794,6 +799,8 @@ impl Qwen35VmmStore {
     /// `remaining` prompt rows. On the exact route every Prefill row range
     /// must have exactly this length (the planner uses it as the request's
     /// chunk maximum); chunk boundaries change the DeltaNet requant cadence.
+    /// The opening chunk stops on `turn_boundary` when that boundary sits
+    /// inside it. Later chunks keep the ordinary length.
     pub fn exact_prefill_chunk_len(
         &self,
         gpu: &Gpu,

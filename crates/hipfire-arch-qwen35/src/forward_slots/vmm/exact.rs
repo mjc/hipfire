@@ -244,10 +244,16 @@ pub(super) fn prefill_chunk_len(
     let ceiling =
         crate::qwen35::ordinary_prefill_chunk_limit(gpu, weights, config, &st.dn, &st.kv, None)
             .map_err(|e| format!("exact prefill chunk limit: {e}"))?;
-    Ok(
-        crate::qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, ceiling)
-            .unwrap_or(remaining.min(ceiling).max(1)),
-    )
+    let ordinary = crate::qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, ceiling)
+        .unwrap_or(remaining.min(ceiling).max(1));
+    // Same opening cut as the singleton. Provision compares the planned
+    // rows with this length, so a boundary cut planned here is accepted,
+    // and a later chunk stays on the ordinary cadence.
+    Ok(hipfire_runtime::prompt_frame::serve_prefill_chunk_len(
+        ordinary,
+        st.position,
+        st.turn_boundary,
+    ))
 }
 
 fn copy_row(

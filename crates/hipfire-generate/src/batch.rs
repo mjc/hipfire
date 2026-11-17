@@ -2600,7 +2600,10 @@ struct VmmLaneCtl {
     drain: Option<VmmDrain>,
     /// The request's user-turn boundary (the singleton's `turn_boundary`): its
     /// prompt prefill snapshots at its newest chunk end at or before it, so a
-    /// follow-up user turn resumes from there.
+    /// follow-up user turn resumes from there. A chunk from position 0 that
+    /// contains the boundary is shortened to it, matching the singleton.
+    /// Checkpoint resume off leaves this unset, so that chunk keeps the exact
+    /// route's length.
     turn: hipfire_arch_qwen35::speculative::TurnCheckpoint,
     /// Verbatim assistant turn stored when the client commits.
     turn_store: Option<(TurnCacheAction, Vec<u32>)>,
@@ -4548,7 +4551,10 @@ pub fn drive_qwen_vmm_continuous_batch(
                 prefill_tokens: rendered.len() - start,
                 decode_start: rendered.len(),
                 turn: hipfire_arch_qwen35::speculative::TurnCheckpoint {
-                    boundary: turn_boundary,
+                    boundary: hipfire_runtime::prompt_frame::turn_boundary_when_resume(
+                        turn_boundary,
+                        crate::ar::ckpt_resume_enabled(),
+                    ),
                     pin: None,
                 },
                 ..VmmLaneCtl::default()
@@ -4893,7 +4899,16 @@ pub fn drive_qwen_vmm_continuous_batch(
             .collect();
         // Exact route: every prefill chunk must be the singleton route's own
         // chunk for that request (DeltaNet requant cadence), so the planner
-        // takes exactly that length or nothing.
+        // takes exactly that length or nothing. The request stores the same
+        // resume-gated boundary the singleton cuts on, and the chunk length
+        // includes that opening cut. Provision recomputes this length.
+        if let Some(store) = vmm_bundle(&mut model.state).and_then(|b| b.vmm_store.as_mut()) {
+            for (i, epoch) in epochs.iter().enumerate() {
+                if let Some(st) = store.request_state_mut(epoch) {
+                    st.turn_boundary = ctl[i].turn.boundary;
+                }
+            }
+        }
         let forced = (|| -> Result<Vec<Option<usize>>, String> {
             let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
             let store = b.vmm_store.as_ref().ok_or("store not staged")?;
@@ -4919,7 +4934,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                 .collect()
         })();
         planner.forced_prefill_len = match forced {
-            Ok(f) => f,
+            Ok(lengths) => lengths,
             Err(e) => {
                 return fail_all(
                     sched,
