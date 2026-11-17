@@ -2600,7 +2600,8 @@ struct VmmLaneCtl {
     drain: Option<VmmDrain>,
     /// The request's user-turn boundary (the singleton's `turn_boundary`): its
     /// prompt prefill snapshots at its newest chunk end at or before it, so a
-    /// follow-up user turn resumes from there.
+    /// follow-up user turn resumes from there. A chunk from position 0 that
+    /// contains the boundary is shortened to it, matching the singleton.
     turn: hipfire_arch_qwen35::speculative::TurnCheckpoint,
     /// Verbatim assistant turn stored when the client commits.
     turn_store: Option<(TurnCacheAction, Vec<u32>)>,
@@ -4919,7 +4920,29 @@ pub fn drive_qwen_vmm_continuous_batch(
                 .collect()
         })();
         planner.forced_prefill_len = match forced {
-            Ok(f) => f,
+            Ok(mut lengths) => {
+                // Same cut as the singleton: a lane chunk from position 0
+                // that holds the user-turn boundary stops on that boundary.
+                if let Some(store) = vmm_bundle(&mut model.state).and_then(|b| b.vmm_store.as_ref())
+                {
+                    for (i, len) in lengths.iter_mut().enumerate() {
+                        let Some(len) = len else { continue };
+                        let Some(st) = store.request_state(&epochs[i]) else {
+                            continue;
+                        };
+                        if let Some(cut) =
+                            hipfire_runtime::prompt_frame::leading_chunk_cut_at_boundary(
+                                st.position,
+                                *len,
+                                ctl[i].turn.boundary,
+                            )
+                        {
+                            *len = cut;
+                        }
+                    }
+                }
+                lengths
+            }
             Err(e) => {
                 return fail_all(
                     sched,

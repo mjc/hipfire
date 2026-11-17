@@ -1662,11 +1662,30 @@ pub fn user_turn_resume_boundary(
 /// Whether the prefill chunk `[pos, pos + len)` holds the user-turn `boundary`.
 /// Checked before forwarding each chunk: `pos` is then the newest existing
 /// chunk end at or before the boundary (or the prefill's start), which is where
-/// the user-turn snapshot is taken. The chunk plan itself is never changed, so
-/// the snapshot only copies state and the prefill's numerics stay untouched
-/// (an added chunk boundary moves the logits of long prompts).
+/// the user-turn snapshot is taken. Callers leave a chunk that already starts
+/// after position 0 unchanged, so a long prompt keeps its requant cadence.
 pub fn chunk_holds_turn_boundary(pos: usize, len: usize, boundary: Option<usize>) -> bool {
     matches!(boundary, Some(b) if pos <= b && b < pos + len)
+}
+
+/// Length to forward before a user-turn snapshot when this chunk starts at
+/// position 0 and `boundary` sits strictly inside it.
+///
+/// A snapshot at position 0 is discarded, so a one-chunk prompt otherwise
+/// keeps only a checkpoint at its end, and a re-send of that prompt has
+/// nothing to replay. Returning the boundary makes the next chunk start
+/// there. A chunk that already starts after 0 is not cut: its start is a
+/// usable snapshot.
+pub fn leading_chunk_cut_at_boundary(
+    pos: usize,
+    len: usize,
+    boundary: Option<usize>,
+) -> Option<usize> {
+    if pos != 0 {
+        return None;
+    }
+    let boundary = boundary.filter(|b| *b > 0)?;
+    chunk_holds_turn_boundary(0, len, Some(boundary)).then_some(boundary)
 }
 
 /// Does this template already emit `primer` at the head of a HISTORY
@@ -5273,5 +5292,18 @@ SYS:{{ build_system_message(system_message) }}:END
         // Boundary behind the prefill, or none.
         assert!(!chunk_holds_turn_boundary(600, 64, Some(521)));
         assert!(!chunk_holds_turn_boundary(0, 512, None));
+    }
+
+    #[test]
+    fn one_chunk_prompt_cuts_at_the_boundary_so_a_resend_can_replay() {
+        // 100-token prompt, one chunk from 0, opener boundary at 43. The
+        // cut is the checkpoint a re-send replays from, strictly before the
+        // prompt end. A later chunk is not recut.
+        assert_eq!(leading_chunk_cut_at_boundary(0, 100, Some(43)), Some(43));
+        assert_eq!(leading_chunk_cut_at_boundary(0, 100, Some(100)), None);
+        assert_eq!(leading_chunk_cut_at_boundary(0, 100, Some(0)), None);
+        assert_eq!(leading_chunk_cut_at_boundary(0, 100, None), None);
+        assert_eq!(leading_chunk_cut_at_boundary(256, 256, Some(400)), None);
+        assert_eq!(leading_chunk_cut_at_boundary(768, 44, Some(800)), None);
     }
 }
