@@ -12919,6 +12919,10 @@ impl Gpu {
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_RESIDUAL_WAVE64", false);
         let gfx1151_tight_grid = self.arch_caps.is_gfx1151()
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_RESIDUAL_TIGHT_GRID", false);
+        // The generic kernel already owns two rows per block. gfx1010 launches
+        // ceil(M/2) so the upper half does not exit at the row guard.
+        let gfx1010_tight_grid = self.arch_caps.is_gfx1010()
+            && hipfire_config::developer_bool("HIPFIRE_GFX1010_RESIDUAL_TIGHT_GRID", true);
         let gfx1151_multirow_r2 = self.arch_caps.is_gfx1151()
             && m == 2_048
             && k == 2_048
@@ -13070,9 +13074,9 @@ impl Gpu {
         } else {
             // The generic residual kernel owns row0/row1 in one wave32 block.
             // Its legacy M-sized launch leaves the upper half of the grid to
-            // exit at the row0 guard. Qualify that target-neutral contraction
-            // independently on gfx1151 instead of coupling it to wave64.
-            let grid = if gfx1151_tight_grid {
+            // exit at the row0 guard. gfx1151 keeps that contraction opt-in.
+            // gfx1010 uses it unless HIPFIRE_GFX1010_RESIDUAL_TIGHT_GRID=0.
+            let grid = if gfx1151_tight_grid || gfx1010_tight_grid {
                 (m as u32).div_ceil(2)
             } else {
                 m as u32
@@ -14496,6 +14500,8 @@ impl Gpu {
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_RESIDUAL_WAVE64", false);
         let gfx1151_tight_grid = self.arch_caps.is_gfx1151()
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_RESIDUAL_TIGHT_GRID", false);
+        let gfx1010_tight_grid = self.arch_caps.is_gfx1010()
+            && hipfire_config::developer_bool("HIPFIRE_GFX1010_RESIDUAL_TIGHT_GRID", true);
         let gfx1151_multirow_r2 = self.arch_caps.is_gfx1151()
             && m == 2_048
             && k == 2_048
@@ -14560,8 +14566,9 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4cg256_residual", bytes);
         // Generic residual owns row0/row1 in one wave32 block. Legacy M-sized
         // launch leaves the upper half to exit at the row0 guard; tight_grid
-        // contracts to ceil(M/2) on gfx1151 when env-enabled (same as v1).
-        let grid = if gfx1151_tight_grid {
+        // contracts to ceil(M/2) on gfx1151 when env-enabled, and on gfx1010
+        // unless HIPFIRE_GFX1010_RESIDUAL_TIGHT_GRID=0.
+        let grid = if gfx1151_tight_grid || gfx1010_tight_grid {
             (m as u32).div_ceil(2)
         } else {
             m as u32

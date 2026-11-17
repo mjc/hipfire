@@ -458,6 +458,24 @@ pub(crate) fn unspillable_no_fit_refusal(
     )
 }
 
+/// Lower a configured context that does not leave the prefill reservation.
+///
+/// The post-weight budget is in tokens. A request the card can hold is
+/// unchanged, including a deliberate context below 512. A request the card
+/// cannot hold is clamped to that budget when the budget can still serve a
+/// prefill chunk, and refused when it cannot.
+pub(crate) fn fit_configured_max_seq(requested: usize, card_cap: usize) -> Result<usize, String> {
+    if card_cap >= requested {
+        return Ok(requested);
+    }
+    if card_cap < 512 {
+        return Err(format!(
+            "configured max_seq={requested} does not leave the prefill reservation; this card can hold {card_cap} KV tokens after the weights load"
+        ));
+    }
+    Ok(card_cap)
+}
+
 /// Build the Qwen35 GPU bundle from an HFQ source.
 ///
 /// CPU-only config/compat validation runs **before** weight upload. Every
@@ -565,6 +583,26 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
                 ));
             }
             ctx.max_seq = sequence.model_ctx.min(card_cap);
+        } else {
+            match fit_configured_max_seq(ctx.max_seq, card_cap) {
+                Ok(fitted) => {
+                    if fitted != ctx.max_seq {
+                        eprintln!(
+                            "configured max_seq={} exceeds the post-weight KV budget; using {fitted}",
+                            ctx.max_seq
+                        );
+                    }
+                    ctx.max_seq = fitted;
+                }
+                Err(message) => {
+                    weights.free_gpu(ctx.gpu);
+                    return Err(release_after_failed_load(
+                        message,
+                        weight_lease.take(),
+                        ctx.gpu,
+                    ));
+                }
+            }
         }
         sequence.card_cap = card_cap;
         ctx.sequence = Some(sequence);
@@ -575,6 +613,77 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
                 return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
             }
         };
+    } else {
+        // Legacy storage never gets a sequence: gfx1010 Q8 is one of those
+        // loads, and it still reserves `ctx.max_seq` tokens up front. Apply
+        // the same post-weight budget. A failed VRAM query leaves the request
+        // alone so a caller with no device keeps the historical load.
+        let capacity = (|| -> Result<(usize, usize, usize, usize, u64), String> {
+            let (free, _) = ctx
+                .gpu
+                .device_mem_info()
+                .map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
+            let minimum =
+                crate::qwen35::prefill::minimum_prefill_reservation_bytes(&config, &ctx.gpu.arch)
+                    .ok_or("Qwen minimum PBS sizing overflow")?;
+            let stride = crate::qwen35::prefill::vmm_kv_token_bytes(
+                &config,
+                plan.pair,
+                plan.adaptive.is_some(),
+            )
+            .ok_or("Qwen KV stride overflow")?;
+            let draft_reserve = load_draft_reserve_bytes(hfq.path(), ctx);
+            let card_cap = free
+                .saturating_sub(minimum)
+                .saturating_sub(128 << 20)
+                .saturating_sub(usize::try_from(draft_reserve).unwrap_or(usize::MAX))
+                / stride;
+            Ok((free, minimum, stride, card_cap, draft_reserve))
+        })();
+        match capacity {
+            Ok((free, minimum, stride, card_cap, draft_reserve)) => {
+                eprintln!(
+                    "max_seq budget: free_after_weights={free} min_prefill={minimum} vision_reserve=0 draft_reserve={draft_reserve} page_rounding={} kv_bytes_per_token={stride}",
+                    128 << 20,
+                );
+                match fit_configured_max_seq(ctx.max_seq, card_cap) {
+                    Ok(fitted) => {
+                        if fitted != ctx.max_seq {
+                            eprintln!(
+                                "configured max_seq={} exceeds the post-weight KV budget; using {fitted}",
+                                ctx.max_seq
+                            );
+                            ctx.max_seq = fitted;
+                            plan = match plan_qwen35_gpu_stages(&config, ctx) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    weights.free_gpu(ctx.gpu);
+                                    return Err(release_after_failed_load(
+                                        e,
+                                        weight_lease.take(),
+                                        ctx.gpu,
+                                    ));
+                                }
+                            };
+                        }
+                    }
+                    Err(message) => {
+                        weights.free_gpu(ctx.gpu);
+                        return Err(release_after_failed_load(
+                            message,
+                            weight_lease.take(),
+                            ctx.gpu,
+                        ));
+                    }
+                }
+            }
+            Err(message) => {
+                eprintln!(
+                    "post-weight KV budget unavailable ({message}); keeping configured max_seq={}",
+                    ctx.max_seq
+                );
+            }
+        }
     }
 
     // ── KV (transactional: free weights on fail) ─────────────────────
@@ -1616,6 +1725,16 @@ mod tests {
     use super::*;
     use hipfire_runtime::kv_adaptive::{KMode, Preset};
     use hipfire_runtime::llama::VMode;
+
+    #[test]
+    fn configured_context_clamps_to_the_post_weight_budget() {
+        assert_eq!(fit_configured_max_seq(139_264, 8_192).unwrap(), 8_192);
+        assert_eq!(fit_configured_max_seq(4_096, 8_192).unwrap(), 4_096);
+        assert_eq!(fit_configured_max_seq(512, 512).unwrap(), 512);
+        assert_eq!(fit_configured_max_seq(128, 128).unwrap(), 128);
+        let err = fit_configured_max_seq(139_264, 100).unwrap_err();
+        assert!(err.contains("139264") && err.contains("100"), "{err}");
+    }
 
     #[test]
     fn ddtree_with_cask_is_refused_up_front() {
